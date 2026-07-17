@@ -1,0 +1,18 @@
+# Smoke test: the extension loads and registers its table functions.
+# Does not require a running NATS server; it only checks registration, since
+# CI has no broker. Behavioral tests against a live stream are run locally.
+
+require duckstream
+
+# read_nats is registered as a table function.
+query I
+SELECT count(*) FROM duckdb_functions() WHERE function_name = 'read_nats';
+----
+1
+
+# It is a table function.
+query I
+SELECT count(*) FROM duckdb_functions()
+WHERE function_name = 'read_nats' AND function_type = 'table';
+----
+1

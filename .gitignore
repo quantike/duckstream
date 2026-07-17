@@ -1,10 +1,14 @@
-# Rust build artifacts
+# Rust build output
 /target
-Cargo.lock
 
-# DuckDB extension build output (added when the ci-tools flow is wired up)
-/build
-/configure
+# DuckDB extension build flow (extension-ci-tools)
+build
+configure
+duckdb_unittest_tempdir
+/test/bin
+venv
+testext
 
-# Editor / OS
+# Editors / OS
+.idea
 .DS_Store

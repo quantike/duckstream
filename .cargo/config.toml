@@ -1,0 +1,18 @@
+# Required for building DuckDB loadable extensions with the duckdb crate.
+# The extension resolves DuckDB C API symbols at load time from the host
+# process, so undefined symbols must be allowed at link time.
+[target.x86_64-apple-darwin]
+rustflags = ["-Clink-arg=-Wl,-undefined,dynamic_lookup"]
+
+[target.aarch64-apple-darwin]
+rustflags = ["-Clink-arg=-Wl,-undefined,dynamic_lookup"]
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-Clink-arg=-Wl,-undefined,-Wl,dynamic_lookup"]
+
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["-Clink-arg=-Wl,-undefined,-Wl,dynamic_lookup"]
+
+# Statically link the C runtime on Windows (mirrors the official template).
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-Ctarget-feature=+crt-static"]
