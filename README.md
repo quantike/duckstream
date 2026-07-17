@@ -12,8 +12,9 @@ targeting DuckDB v1.5.4.
 
 - Bounded reads over a JetStream stream by sequence (`start_seq`/`end_seq`) or timestamp
   (`start_time`/`end_time`).
-- Two read modes: a stateless scan (JetStream Direct Get) and an ephemeral consumer that drains
-  everything currently in the stream and reports progress.
+- Three read modes: a stateless scan (JetStream Direct Get), an ephemeral consumer that drains
+  everything currently in the stream, and a durable consumer that persists a cursor and resumes
+  from where the last run left off. Both consumer modes report progress.
 - Subject filtering with NATS token semantics (`*` matches one token, `>` matches trailing tokens).
 - JSON extraction: name JSON field paths (dot notation for nested fields) and get one column each.
   Scalars render as their natural value, nested values as JSON text.
@@ -28,32 +29,39 @@ The extension registers the `read_nats` table function. It returns five base col
 
 ### `read_nats(stream, ...)`
 
-A bounded read that always completes. It runs in one of two modes:
+A bounded read that always completes. It runs in one of three modes:
 
 - Scan (default): a stateless read by sequence or timestamp range, using the JetStream Direct Get
   API.
 - Ephemeral consumer (`ephemeral => true`): creates a throwaway JetStream consumer that drains every
-  message in the stream up to the moment of the query, then completes. This mode reports its message
-  count as the query cardinality, so DuckDB shows a progress bar, and applies the subject filter
-  server-side.
+  message in the stream up to the moment of the query, then completes.
+- Durable consumer (`durable => 'name'`): creates or attaches a named, server-persisted consumer.
+  Each run reads only the messages that arrived since the last run, resuming from the stored cursor.
+
+Both consumer modes report their message count as the query cardinality, so DuckDB shows a progress
+bar, and apply the subject filter server-side.
 
 | Parameter       | Type      | Description                                                                                             |
 | --------------- | --------- | ------------------------------------------------------------------------------------------------------- |
 | `stream`        | VARCHAR   | Stream name (positional, required).                                                                     |
 | `url`           | VARCHAR   | NATS server URL. Default `nats://localhost:4222`.                                                       |
 | `ephemeral`     | BOOLEAN   | `true` reads via an ephemeral consumer instead of a scan. Default `false`.                              |
-| `subject`       | VARCHAR   | NATS subject filter, wildcards allowed (`*`, `>`). Applied client-side in scan mode, server-side in ephemeral mode. |
-| `start_seq`     | UBIGINT   | Start sequence (inclusive). Scan mode.                                                                  |
+| `durable`       | VARCHAR   | Consumer name. Selects durable mode. Mutually exclusive with `ephemeral`.                               |
+| `subject`       | VARCHAR   | NATS subject filter, wildcards allowed (`*`, `>`). Applied client-side in scan mode, server-side in consumer modes. |
+| `start_seq`     | UBIGINT   | Start sequence (inclusive). Scan mode, or `deliver => 'by_start_seq'`.                                  |
 | `end_seq`       | UBIGINT   | End sequence (inclusive). Scan mode.                                                                    |
-| `start_time`    | TIMESTAMP | Start time (inclusive). Scan mode.                                                                      |
+| `start_time`    | TIMESTAMP | Start time (inclusive). Scan mode, or `deliver => 'by_start_time'`.                                     |
 | `end_time`      | TIMESTAMP | End time (inclusive). Scan mode.                                                                        |
+| `deliver`       | VARCHAR   | Starting point for a new consumer: `all` (default), `new`, `last`, `by_start_seq`, `by_start_time`. Honored only when the consumer is first created. Consumer modes. |
+| `ack`           | BOOLEAN   | Ack each message on emit, advancing the durable cursor (at-least-once). Default `false`. Durable mode. |
 | `json_extract`  | VARCHAR[] | JSON field paths, each mapped to a VARCHAR column.                                                      |
 | `proto_file`    | VARCHAR   | Path to a `.proto` schema file.                                                                         |
 | `proto_message` | VARCHAR   | Message type name within the schema.                                                                    |
 | `proto_extract` | VARCHAR[] | Protobuf field paths, each mapped to a schema-typed column.                                             |
 
 `json_extract` and `proto_extract` cannot be used together. `proto_extract` requires both
-`proto_file` and `proto_message`.
+`proto_file` and `proto_message`. `durable` and `ephemeral` cannot be used together, and `ack`
+requires `durable`.
 
 ```sql
 -- Scan a sequence range
@@ -62,6 +70,9 @@ FROM read_nats('ORDERS', start_seq => 1, end_seq => 100);
 
 -- Ephemeral consumer: read everything currently in the stream (with a progress bar)
 SELECT count(*) FROM read_nats('ORDERS', ephemeral => true);
+
+-- Durable consumer: each run reads only new messages and acks them
+SELECT * FROM read_nats('ORDERS', durable => 'nightly_etl', ack => true);
 
 -- Filter by subject and extract JSON fields as columns
 SELECT "order.id", total
