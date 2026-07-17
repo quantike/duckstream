@@ -288,7 +288,11 @@ impl VTab for ReadNats {
                 .build()?;
             let (consumer, pending) =
                 runtime.block_on(create_ephemeral_consumer(&url, &stream, subject.as_deref()))?;
-            bind.set_cardinality(pending, true);
+            // num_pending is a point-in-time snapshot taken when the consumer was
+            // created, not a guarantee, so report it as an estimate (is_exact =
+            // false). This still drives the progress bar while avoiding an
+            // overconfident cardinality that could mislead join planning.
+            bind.set_cardinality(pending, false);
             Some(ConsumerSetup {
                 runtime,
                 consumer,
