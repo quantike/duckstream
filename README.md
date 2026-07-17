@@ -12,6 +12,8 @@ targeting DuckDB v1.5.4.
 
 - Bounded reads over a JetStream stream by sequence (`start_seq`/`end_seq`) or timestamp
   (`start_time`/`end_time`).
+- Two read modes: a stateless scan (JetStream Direct Get) and an ephemeral consumer that drains
+  everything currently in the stream and reports progress.
 - Subject filtering with NATS token semantics (`*` matches one token, `>` matches trailing tokens).
 - JSON extraction: name JSON field paths (dot notation for nested fields) and get one column each.
   Scalars render as their natural value, nested values as JSON text.
@@ -26,30 +28,40 @@ The extension registers the `read_nats` table function. It returns five base col
 
 ### `read_nats(stream, ...)`
 
-A bounded, stateless read of a stream by sequence or timestamp range, using the JetStream Direct Get
-API. The query always completes.
+A bounded read that always completes. It runs in one of two modes:
 
-| Parameter       | Type      | Description                                                             |
-| --------------- | --------- | ----------------------------------------------------------------------- |
-| `stream`        | VARCHAR   | Stream name (positional, required).                                     |
-| `url`           | VARCHAR   | NATS server URL. Default `nats://localhost:4222`.                       |
-| `subject`       | VARCHAR   | NATS subject filter, wildcards allowed (`*`, `>`), applied client-side. |
-| `start_seq`     | UBIGINT   | Start sequence (inclusive).                                             |
-| `end_seq`       | UBIGINT   | End sequence (inclusive).                                               |
-| `start_time`    | TIMESTAMP | Start time (inclusive).                                                 |
-| `end_time`      | TIMESTAMP | End time (inclusive).                                                   |
-| `json_extract`  | VARCHAR[] | JSON field paths, each mapped to a VARCHAR column.                      |
-| `proto_file`    | VARCHAR   | Path to a `.proto` schema file.                                         |
-| `proto_message` | VARCHAR   | Message type name within the schema.                                    |
-| `proto_extract` | VARCHAR[] | Protobuf field paths, each mapped to a schema-typed column.             |
+- Scan (default): a stateless read by sequence or timestamp range, using the JetStream Direct Get
+  API.
+- Ephemeral consumer (`ephemeral => true`): creates a throwaway JetStream consumer that drains every
+  message in the stream up to the moment of the query, then completes. This mode reports its message
+  count as the query cardinality, so DuckDB shows a progress bar, and applies the subject filter
+  server-side.
+
+| Parameter       | Type      | Description                                                                                             |
+| --------------- | --------- | ------------------------------------------------------------------------------------------------------- |
+| `stream`        | VARCHAR   | Stream name (positional, required).                                                                     |
+| `url`           | VARCHAR   | NATS server URL. Default `nats://localhost:4222`.                                                       |
+| `ephemeral`     | BOOLEAN   | `true` reads via an ephemeral consumer instead of a scan. Default `false`.                              |
+| `subject`       | VARCHAR   | NATS subject filter, wildcards allowed (`*`, `>`). Applied client-side in scan mode, server-side in ephemeral mode. |
+| `start_seq`     | UBIGINT   | Start sequence (inclusive). Scan mode.                                                                  |
+| `end_seq`       | UBIGINT   | End sequence (inclusive). Scan mode.                                                                    |
+| `start_time`    | TIMESTAMP | Start time (inclusive). Scan mode.                                                                      |
+| `end_time`      | TIMESTAMP | End time (inclusive). Scan mode.                                                                        |
+| `json_extract`  | VARCHAR[] | JSON field paths, each mapped to a VARCHAR column.                                                      |
+| `proto_file`    | VARCHAR   | Path to a `.proto` schema file.                                                                         |
+| `proto_message` | VARCHAR   | Message type name within the schema.                                                                    |
+| `proto_extract` | VARCHAR[] | Protobuf field paths, each mapped to a schema-typed column.                                             |
 
 `json_extract` and `proto_extract` cannot be used together. `proto_extract` requires both
 `proto_file` and `proto_message`.
 
 ```sql
--- Read a sequence range
+-- Scan a sequence range
 SELECT seq, subject, payload
 FROM read_nats('ORDERS', start_seq => 1, end_seq => 100);
+
+-- Ephemeral consumer: read everything currently in the stream (with a progress bar)
+SELECT count(*) FROM read_nats('ORDERS', ephemeral => true);
 
 -- Filter by subject and extract JSON fields as columns
 SELECT "order.id", total
@@ -85,15 +97,22 @@ API via `duckdb-rs`. The produced binary loads only into that exact DuckDB versi
 
 ### Loading
 
-A locally built (unsigned) extension requires the `-unsigned` flag:
+A locally built (unsigned) extension requires the `-unsigned` flag. macOS refuses to load an
+extension by relative path, so use an absolute path:
 
 ```sh
 duckdb -unsigned
 ```
 
 ```sql
-LOAD './build/debug/duckstream.duckdb_extension';
+LOAD '/absolute/path/to/duckstream/build/debug/duckstream.duckdb_extension';
 SELECT * FROM read_nats('ORDERS');
+```
+
+Or preload it when launching from the repo root:
+
+```sh
+duckdb -unsigned -cmd "LOAD '$PWD/build/debug/duckstream.duckdb_extension'"
 ```
 
 ## Testing

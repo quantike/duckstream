@@ -48,6 +48,12 @@ enum ScanError {
         #[source]
         source: Box<dyn Error + Send + Sync>,
     },
+    #[error("failed to create consumer on stream '{stream}': {source}")]
+    Consumer {
+        stream: String,
+        #[source]
+        source: Box<dyn Error + Send + Sync>,
+    },
     #[error("could not parse timestamp '{value}'")]
     BadTimestamp { value: String },
     #[error("invalid NATS subject filter '{value}'")]
@@ -84,34 +90,66 @@ struct ReadNatsBindData {
     proto_descriptor: Option<MessageDescriptor>,
     /// Resolved protobuf field paths + their DuckDB column types.
     proto_fields: Vec<ProtoField>,
+    /// True when the read uses an ephemeral JetStream consumer instead of the
+    /// stateless Direct Get scan path.
+    ephemeral: bool,
+    /// Consumer + runtime created during bind (for cardinality), moved out by
+    /// init. `Mutex<Option<_>>` because bind data is only borrowed as `&`.
+    consumer_setup: Mutex<Option<ConsumerSetup>>,
 }
 
-/// Execution state for a scan.
-///
-/// Holds the owned Tokio runtime plus the connected JetStream handle and the
-/// resolved sequence cursor, all behind a [`Mutex`] because DuckDB shares the
-/// init data across threads as `&InitData`.
+/// The ephemeral consumer and the runtime that owns it, created in bind so the
+/// consumer's `num_pending` can be reported as query cardinality.
+struct ConsumerSetup {
+    runtime: Runtime,
+    consumer: jetstream::consumer::PullConsumer,
+    pending: u64,
+}
+
+/// Execution state, shared across DuckDB worker threads via the init data's
+/// mutex.
 struct ReadNatsInitData {
     runtime: Runtime,
     inner: Mutex<ScanState>,
 }
 
-/// Mutable scan progress, guarded by the init data's mutex.
+/// Mutable read progress, guarded by the init data's mutex.
+///
+/// Despite the name, this backs both the Direct Get scan path and the ephemeral
+/// consumer path; [`Source`] holds the source-specific cursor.
 struct ScanState {
-    stream: jetstream::stream::Stream,
     stream_name: String,
-    /// Optional compiled subject filter, applied client-side per message.
+    /// Optional subject filter. Applied client-side in scan mode; applied
+    /// server-side (the consumer's `filter_subject`) in consumer mode, where it
+    /// stays `None` here.
     subject: Option<String>,
     /// JSON field paths to extract as extra columns.
     json_fields: Vec<String>,
     /// Compiled protobuf descriptor + resolved field paths, if using protobuf.
     proto_descriptor: Option<MessageDescriptor>,
     proto_fields: Vec<ProtoField>,
-    /// Next sequence to fetch (inclusive).
-    current_seq: u64,
-    /// Last sequence to fetch (inclusive).
-    end_seq: u64,
+    source: Source,
     done: bool,
+}
+
+/// The source of messages for a read.
+enum Source {
+    /// Stateless Direct Get scan over a bounded sequence range.
+    Scan {
+        stream: jetstream::stream::Stream,
+        /// Next sequence to fetch (inclusive).
+        current_seq: u64,
+        /// Last sequence to fetch (inclusive).
+        end_seq: u64,
+    },
+    /// Bounded drain of an ephemeral pull consumer, up to the messages that
+    /// existed when the consumer was created.
+    Consumer {
+        consumer: jetstream::consumer::PullConsumer,
+        /// Messages left to drain (from the consumer's `num_pending` at
+        /// creation). Reaching zero ends the read.
+        remaining: u64,
+    },
 }
 
 /// The `read_nats` table function. See the crate README for the full contract.
@@ -234,6 +272,32 @@ impl VTab for ReadNats {
             .map(|v| parse_timestamp_micros(&v.to_string()))
             .transpose()?;
 
+        let ephemeral = bind
+            .get_named_parameter("ephemeral")
+            .map(|v| v.to_bool())
+            .unwrap_or(false);
+
+        // For consumer mode, create the ephemeral consumer now (in bind) so we
+        // can report its `num_pending` as the query cardinality. This drives
+        // DuckDB's built-in query progress bar. The consumer handle and the
+        // runtime that owns it are carried forward to init/func.
+        let consumer_setup = if ephemeral {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()?;
+            let (consumer, pending) =
+                runtime.block_on(create_ephemeral_consumer(&url, &stream, subject.as_deref()))?;
+            bind.set_cardinality(pending, true);
+            Some(ConsumerSetup {
+                runtime,
+                consumer,
+                pending,
+            })
+        } else {
+            None
+        };
+
         Ok(ReadNatsBindData {
             stream,
             url,
@@ -245,12 +309,45 @@ impl VTab for ReadNats {
             json_fields,
             proto_descriptor,
             proto_fields,
+            ephemeral,
+            consumer_setup: Mutex::new(consumer_setup),
         })
     }
 
     fn init(info: &InitInfo) -> Result<Self::InitData, Box<dyn Error>> {
         let bind_data = unsafe { &*info.get_bind_data::<ReadNatsBindData>() };
 
+        // Consumer mode: reuse the runtime + consumer created during bind.
+        if bind_data.ephemeral {
+            let setup = bind_data
+                .consumer_setup
+                .lock()
+                .unwrap()
+                .take()
+                .expect("ephemeral consumer setup missing from bind data");
+
+            let state = ScanState {
+                stream_name: bind_data.stream.clone(),
+                // Subject filtering is server-side for consumers, so no
+                // client-side filter is applied during the drain.
+                subject: None,
+                json_fields: bind_data.json_fields.clone(),
+                proto_descriptor: bind_data.proto_descriptor.clone(),
+                proto_fields: bind_data.proto_fields.clone(),
+                done: setup.pending == 0,
+                source: Source::Consumer {
+                    consumer: setup.consumer,
+                    remaining: setup.pending,
+                },
+            };
+
+            return Ok(ReadNatsInitData {
+                runtime: setup.runtime,
+                inner: Mutex::new(state),
+            });
+        }
+
+        // Scan mode: own a fresh runtime and resolve the sequence window.
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .enable_all()
@@ -320,10 +417,12 @@ impl VTab for ReadNats {
                 json_fields: bind_data.json_fields.clone(),
                 proto_descriptor: bind_data.proto_descriptor.clone(),
                 proto_fields: bind_data.proto_fields.clone(),
-                current_seq,
-                end_seq,
                 done: last_sequence == 0 || end_seq == 0 || current_seq > end_seq,
-                stream,
+                source: Source::Scan {
+                    stream,
+                    current_seq,
+                    end_seq,
+                },
             })
         })?;
 
@@ -345,6 +444,122 @@ impl VTab for ReadNats {
             return Ok(());
         }
 
+        // Collect up to one vector's worth of rows from the active source. Each
+        // row is reduced to (subject, seq, ts_micros, payload) so the column
+        // writing below is identical regardless of source.
+        //
+        // PERF: this materializes an owned copy of every message (String subject
+        // + Vec<u8> payload) into an intermediate Vec before writing to the
+        // output vectors. It decouples message acquisition from column writing
+        // but doubles the per-message allocation/copy. A faster design would
+        // write each message straight into the output vectors as it is fetched,
+        // avoiding the intermediate Vec and the payload clone entirely.
+        let subject_filter = state.subject.clone();
+        let mut rows: Vec<(String, u64, i64, Vec<u8>)> = Vec::with_capacity(VECTOR_SIZE);
+
+        match &mut state.source {
+            Source::Scan {
+                stream,
+                current_seq,
+                end_seq,
+            } => {
+                while rows.len() < VECTOR_SIZE && *current_seq <= *end_seq {
+                    let seq = *current_seq;
+                    *current_seq = seq.saturating_add(1);
+
+                    // Prefer Direct Get (replica-served); fall back to the
+                    // leader-only raw API for streams without `allow_direct`. A
+                    // missing sequence (deleted/purged) is skipped.
+                    //
+                    // PERF: one blocking network round-trip per message. On large
+                    // ranges this is the dominant cost. A batched Direct Get
+                    // (multi-message request) or a pull-consumer drain would cut
+                    // the round-trips dramatically; the consumer path below
+                    // already fetches in batches for this reason.
+                    let fetched = init.runtime.block_on(async {
+                        match stream.direct_get(seq).await {
+                            Ok(msg) => Some(msg),
+                            Err(_) => stream.get_raw_message(seq).await.ok(),
+                        }
+                    });
+                    let Some(msg) = fetched else {
+                        continue;
+                    };
+
+                    // Scan filtering is client-side (no server consumer).
+                    if let Some(filter) = &subject_filter {
+                        if !subject_matches(filter, msg.subject.as_str()) {
+                            continue;
+                        }
+                    }
+
+                    rows.push((
+                        msg.subject.to_string(),
+                        msg.sequence,
+                        (msg.time.unix_timestamp_nanos() / 1_000) as i64,
+                        msg.payload.to_vec(),
+                    ));
+                }
+                if *current_seq > *end_seq {
+                    state.done = true;
+                }
+            }
+            Source::Consumer {
+                consumer,
+                remaining,
+            } => {
+                use futures_util::StreamExt;
+
+                let want = (*remaining).min(VECTOR_SIZE as u64) as usize;
+                if want > 0 {
+                    // PERF: one `fetch` request per func call (per output vector).
+                    // Fine for bounded drains, but each request has round-trip
+                    // latency; for very large streams a persistent pull
+                    // subscription reused across func calls would amortize that.
+                    let fetched: Vec<_> = init.runtime.block_on(async {
+                        let mut out = Vec::with_capacity(want);
+                        // `fetch` uses no_wait: returns what is available now and
+                        // ends, so this drains without blocking indefinitely.
+                        if let Ok(mut batch) = consumer.fetch().max_messages(want).messages().await
+                        {
+                            while let Some(Ok(msg)) = batch.next().await {
+                                let (seq, ts_micros) = match msg.info() {
+                                    Ok(info) => (
+                                        info.stream_sequence,
+                                        (info.published.unix_timestamp_nanos() / 1_000) as i64,
+                                    ),
+                                    Err(_) => (0, 0),
+                                };
+                                out.push((
+                                    msg.subject.to_string(),
+                                    seq,
+                                    ts_micros,
+                                    msg.payload.to_vec(),
+                                ));
+                            }
+                        }
+                        out
+                    });
+
+                    *remaining = remaining.saturating_sub(fetched.len() as u64);
+                    rows = fetched;
+                }
+                if *remaining == 0 || rows.is_empty() {
+                    state.done = true;
+                }
+            }
+        }
+
+        // PERF: these clones happen on every func call (once per output vector).
+        // They exist to release the `state` mutex borrow before writing to the
+        // output vectors. The field lists are small, but for hot paths this
+        // config could be hoisted into the init data as shared, read-only data
+        // (e.g. Arc) and borrowed instead of cloned.
+        let stream_name = state.stream_name.clone();
+        let json_fields = state.json_fields.clone();
+        let proto_descriptor = state.proto_descriptor.clone();
+        let proto_fields = state.proto_fields.clone();
+
         let stream_vec = output.flat_vector(0);
         let subject_vec = output.flat_vector(1);
         let mut seq_vec = output.flat_vector(2);
@@ -353,62 +568,32 @@ impl VTab for ReadNats {
 
         // Extra columns for extracted JSON fields, in declared order after the
         // five base columns.
-        let json_fields = state.json_fields.clone();
         let mut json_vecs: Vec<_> = (0..json_fields.len())
             .map(|i| output.flat_vector(5 + i))
             .collect();
 
         // Extra columns for extracted protobuf fields (mutually exclusive with
         // JSON, so they also begin at index 5).
-        let proto_descriptor = state.proto_descriptor.clone();
-        let proto_fields = state.proto_fields.clone();
         let mut proto_vecs: Vec<_> = (0..proto_fields.len())
             .map(|i| output.flat_vector(5 + i))
             .collect();
 
-        let mut n = 0usize;
-        while n < VECTOR_SIZE && state.current_seq <= state.end_seq {
-            let seq = state.current_seq;
-            state.current_seq = seq.saturating_add(1);
-
-            // Fetch one message by sequence. Prefer the Direct Get API (can be
-            // served by replicas), falling back to the leader-only raw message
-            // API for streams without `allow_direct`. A sequence that is absent
-            // (deleted/purged) yields None and is skipped.
-            let fetched = init.runtime.block_on(async {
-                match state.stream.direct_get(seq).await {
-                    Ok(msg) => Some(msg),
-                    Err(_) => state.stream.get_raw_message(seq).await.ok(),
-                }
-            });
-
-            let Some(msg) = fetched else {
-                continue;
-            };
-
-            // Client-side subject filtering with NATS token semantics. Scan mode
-            // is stateless (no server consumer), so filtering happens here.
-            if let Some(filter) = &state.subject {
-                if !subject_matches(filter, msg.subject.as_str()) {
-                    continue;
-                }
-            }
-
-            stream_vec.insert(n, state.stream_name.as_str());
-            subject_vec.insert(n, msg.subject.as_str());
+        for (n, (subject, seq, ts_micros, payload)) in rows.iter().enumerate() {
+            stream_vec.insert(n, stream_name.as_str());
+            subject_vec.insert(n, subject.as_str());
             // Safety: n < VECTOR_SIZE and the vectors are sized for
             // STANDARD_VECTOR_SIZE; rows are written sequentially from 0.
             unsafe {
-                seq_vec.as_mut_slice::<u64>()[n] = msg.sequence;
-                ts_vec.as_mut_slice::<i64>()[n] = (msg.time.unix_timestamp_nanos() / 1_000) as i64;
+                seq_vec.as_mut_slice::<u64>()[n] = *seq;
+                ts_vec.as_mut_slice::<i64>()[n] = *ts_micros;
             }
-            payload_vec.insert(n, msg.payload.as_ref());
+            payload_vec.insert(n, payload.as_slice());
 
             if !json_fields.is_empty() {
                 // Parse once per message; a payload that is not valid JSON leaves
                 // every extracted column NULL for this row (the row is still
                 // emitted with its base columns).
-                let doc: Option<serde_json::Value> = serde_json::from_slice(&msg.payload).ok();
+                let doc: Option<serde_json::Value> = serde_json::from_slice(payload).ok();
                 for (i, path) in json_fields.iter().enumerate() {
                     match doc.as_ref().and_then(|d| json_extract_string(d, path)) {
                         Some(s) => json_vecs[i].insert(n, s.as_str()),
@@ -420,7 +605,7 @@ impl VTab for ReadNats {
             if let Some(descriptor) = &proto_descriptor {
                 // Decode once per message; an undecodable payload leaves every
                 // extracted column NULL for this row (row still emitted).
-                let decoded = proto::decode_message(descriptor, &msg.payload);
+                let decoded = proto::decode_message(descriptor, payload);
                 for (i, field) in proto_fields.iter().enumerate() {
                     let value = decoded
                         .as_ref()
@@ -429,15 +614,9 @@ impl VTab for ReadNats {
                     write_proto_value(&mut proto_vecs[i], n, value);
                 }
             }
-
-            n += 1;
         }
 
-        if state.current_seq > state.end_seq {
-            state.done = true;
-        }
-
-        output.set_len(n);
+        output.set_len(rows.len());
         Ok(())
     }
 
@@ -477,6 +656,55 @@ impl VTab for ReadNats {
 pub unsafe fn extension_entrypoint(con: Connection) -> Result<(), Box<dyn Error>> {
     con.register_table_function::<ReadNats>("read_nats")?;
     Ok(())
+}
+
+/// Connect and create an ephemeral pull consumer that will deliver every
+/// message currently in the stream (`DeliverPolicy::All`), optionally filtered
+/// by subject server-side. Returns the consumer and its `num_pending` count at
+/// creation, which bounds the drain and drives the query progress bar.
+async fn create_ephemeral_consumer(
+    url: &str,
+    stream_name: &str,
+    subject: Option<&str>,
+) -> Result<(jetstream::consumer::PullConsumer, u64), ScanError> {
+    use async_nats::jetstream::consumer::{pull, AckPolicy, DeliverPolicy};
+
+    let client = async_nats::connect(url)
+        .await
+        .map_err(|source| ScanError::Connect {
+            url: url.to_string(),
+            source,
+        })?;
+    let context = jetstream::new(client);
+
+    let stream = context
+        .get_stream(stream_name)
+        .await
+        .map_err(|e| ScanError::StreamInfo {
+            stream: stream_name.to_string(),
+            source: Box::new(e),
+        })?;
+
+    let config = pull::Config {
+        durable_name: None, // ephemeral
+        deliver_policy: DeliverPolicy::All,
+        ack_policy: AckPolicy::None,
+        filter_subject: subject.unwrap_or("").to_string(),
+        // Reap the server-side consumer shortly after we stop draining.
+        inactive_threshold: std::time::Duration::from_secs(30),
+        ..Default::default()
+    };
+
+    let consumer = stream
+        .create_consumer(config)
+        .await
+        .map_err(|e| ScanError::Consumer {
+            stream: stream_name.to_string(),
+            source: Box::new(e),
+        })?;
+
+    let pending = consumer.cached_info().num_pending;
+    Ok((consumer, pending))
 }
 
 /// Fetch a single message's server timestamp, in microseconds since the Unix

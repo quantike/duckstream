@@ -12,6 +12,7 @@ crate-type = ["cdylib"]
 [dependencies]
 async-nats = "0.49.1"
 duckdb = { version = "~1.10504.0", features = ["loadable-extension", "vtab"] }
+futures-util = "0.3.32"
 prost = "0.14.4"
 prost-reflect = "0.16.5"
 protox = "0.9.1"
