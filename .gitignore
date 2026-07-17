@@ -1,0 +1,10 @@
+# Rust build artifacts
+/target
+Cargo.lock
+
+# DuckDB extension build output (added when the ci-tools flow is wired up)
+/build
+/configure
+
+# Editor / OS
+.DS_Store
