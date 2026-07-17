@@ -1,18 +1,9 @@
-# Required for building DuckDB loadable extensions with the duckdb crate.
-# The extension resolves DuckDB C API symbols at load time from the host
-# process, so undefined symbols must be allowed at link time.
-[target.x86_64-apple-darwin]
-rustflags = ["-Clink-arg=-Wl,-undefined,dynamic_lookup"]
-
-[target.aarch64-apple-darwin]
-rustflags = ["-Clink-arg=-Wl,-undefined,dynamic_lookup"]
-
-[target.x86_64-unknown-linux-gnu]
-rustflags = ["-Clink-arg=-Wl,-undefined,-Wl,dynamic_lookup"]
-
-[target.aarch64-unknown-linux-gnu]
-rustflags = ["-Clink-arg=-Wl,-undefined,-Wl,dynamic_lookup"]
-
-# Statically link the C runtime on Windows (mirrors the official template).
+# The `duckdb` crate's `loadable-extension` feature handles the per-platform
+# linker flags needed to leave DuckDB C API symbols undefined (resolved from the
+# host process at load time). Do NOT set `-undefined dynamic_lookup` here: it is
+# a Mach-O-only flag that breaks a plain `cargo build`/`clippy` on Linux (lld
+# reads `dynamic_lookup` as a missing input file) and poisons every cargo
+# invocation, including build scripts. This mirrors the official
+# extension-template-rs, which only pins the Windows C runtime.
 [target.x86_64-pc-windows-msvc]
 rustflags = ["-Ctarget-feature=+crt-static"]
