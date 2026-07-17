@@ -1,4 +1,4 @@
-.PHONY: clean clean_all
+.PHONY: clean clean_all fmt lint check changelog release-tag
 
 PROJ_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 
@@ -30,3 +30,33 @@ test_release: test_extension_release
 
 clean: clean_build clean_rust
 clean_all: clean_configure clean
+
+fmt: ## Format all Rust sources
+	cargo fmt --all
+
+lint: ## Check formatting and run clippy with warnings denied
+	cargo fmt --all -- --check
+	cargo clippy --all-targets -- -D warnings
+
+check: lint ## Run lint + unit tests (fast pre-commit gate; no extension build)
+	cargo test --lib
+
+changelog: ## Regenerate CHANGELOG.md from the commit history
+	git-cliff --output CHANGELOG.md
+
+# Read the crate version from Cargo.toml (single source of truth), tag it, and
+# push. The Release workflow (triggered by the v* tag) verifies the tag matches
+# this version, cuts the GitHub Release, and opens the CHANGELOG-update PR.
+# MainDistributionPipeline.yml builds the cross-platform binaries on the same
+# tag. (Named release-tag, not release: `release` already builds the optimized
+# extension above.)
+release-tag: ## Tag and push a release (reads version from Cargo.toml)
+	@VERSION=$$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version'); \
+	TAG="v$$VERSION"; \
+	if git rev-parse "$$TAG" >/dev/null 2>&1; then \
+		printf "\033[31mError: tag $$TAG already exists\033[0m\n"; exit 1; \
+	fi; \
+	printf "\033[36mCreating release $$TAG\033[0m\n"; \
+	git tag -a "$$TAG" -m "release: $$TAG"; \
+	git push origin "$$TAG"; \
+	printf "\033[32mPushed $$TAG - Release workflow will cut the GitHub Release\033[0m\n"
