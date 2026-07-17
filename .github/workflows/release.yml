@@ -1,11 +1,13 @@
 #
 # Cuts a GitHub Release when a v* tag is pushed.
 #
-# Scope is deliberately narrow: this workflow verifies the tag, generates
-# release notes from the changelog, creates the GitHub Release, and opens a PR
-# that syncs CHANGELOG.md on main. It does NOT build the extension binaries —
-# MainDistributionPipeline.yml already builds the cross-platform
-# .duckdb_extension artifacts on the same v* tag via DuckDB's reusable pipeline.
+# Scope is deliberately narrow: this workflow verifies the tag and generates the
+# release notes (from conventional commits, via git-cliff) into the GitHub
+# Release body. There is no committed CHANGELOG.md — the GitHub Releases page is
+# the rendered changelog, and the git history is its source. This workflow does
+# NOT build the extension binaries; MainDistributionPipeline.yml already builds
+# the cross-platform .duckdb_extension artifacts on the same v* tag via DuckDB's
+# reusable pipeline.
 #
 # Fast fmt/clippy/test feedback lives in rust.yml (every push/PR); the release
 # gate below re-runs the unit tests so a tag can never ship a red build.
@@ -19,7 +21,6 @@ on:
 
 permissions:
   contents: write
-  pull-requests: write
 
 concurrency:
   group: release-${{ github.ref }}
@@ -84,46 +85,3 @@ jobs:
           body_path: RELEASE_NOTES.md
           generate_release_notes: false
           prerelease: ${{ contains(github.ref_name, '-') }}
-
-  update-changelog:
-    name: Update CHANGELOG.md
-    needs: release
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          ref: main
-
-      - name: Install git-cliff
-        uses: kenji-miyake/setup-git-cliff@v2
-
-      - name: Regenerate full changelog
-        run: git-cliff --output CHANGELOG.md
-
-      - name: Check for changes
-        id: diff
-        run: |
-          if git diff --quiet CHANGELOG.md; then
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Create PR with updated changelog
-        if: steps.diff.outputs.changed == 'true'
-        run: |
-          BRANCH="chore/changelog-${{ github.ref_name }}"
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git checkout -b "$BRANCH"
-          git add CHANGELOG.md
-          git commit -m "docs: update CHANGELOG.md for ${{ github.ref_name }} [skip ci]"
-          git push origin "$BRANCH"
-          gh pr create \
-            --base main \
-            --head "$BRANCH" \
-            --title "docs: update CHANGELOG.md for ${{ github.ref_name }}" \
-            --body "Auto-generated changelog update after release ${{ github.ref_name }}."
-        env:
-          GH_TOKEN: ${{ github.token }}
