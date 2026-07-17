@@ -33,5 +33,8 @@ jobs:
       # Our extension is pure Rust and the test harness uses the DuckDB Python
       # client, so we need both toolchains available in the build image.
       extra_toolchains: rust;python3
-      # musl build of the Rust std/deps is not exercised yet.
-      exclude_archs: 'linux_amd64_musl'
+      # WASM is excluded: the extension needs a Tokio multi-thread runtime and
+      # async-nats TCP networking, neither of which exists in the browser WASM
+      # sandbox. Other networking Rust extensions (chsql_native, pcap_reader)
+      # exclude it the same way. musl is not exercised yet.
+      exclude_archs: 'wasm_mvp;wasm_eh;wasm_threads;linux_amd64_musl'
