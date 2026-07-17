@@ -9,6 +9,13 @@
 //! bounded channel) that unbounded tail requires. It owns a Tokio runtime in
 //! its init data and drives a simple sequential `direct_get` loop with
 //! `Runtime::block_on` from the synchronous `func` callback.
+//!
+//! Consumer mode covers both ephemeral (`ephemeral => true`, a throwaway pull
+//! consumer) and durable (`durable => 'name'`, a server-persisted cursor that
+//! resumes across runs). Both drain a JetStream pull consumer up to its
+//! `num_pending` at creation; durable adds `ack => true` for at-least-once
+//! cursor advancement and a `deliver` policy that selects the starting point at
+//! first creation.
 
 use std::error::Error;
 use std::sync::Mutex;
@@ -64,12 +71,82 @@ enum ScanError {
     ProtoIncomplete,
     #[error("proto_file/proto_message require a non-empty proto_extract list")]
     ProtoNoFields,
+    #[error("durable and ephemeral consumer modes are mutually exclusive")]
+    ModeConflict,
+    #[error("ack requires durable mode (ack => true only applies to durable consumers)")]
+    AckRequiresDurable,
+    #[error(
+        "invalid deliver policy '{value}' (expected all, new, last, by_start_seq, by_start_time)"
+    )]
+    InvalidDeliver { value: String },
+    #[error("deliver => 'by_start_seq' requires start_seq")]
+    DeliverNeedsStartSeq,
+    #[error("deliver => 'by_start_time' requires start_time")]
+    DeliverNeedsStartTime,
+}
+
+/// The starting delivery point for a consumer, mirroring JetStream's
+/// `DeliverPolicy`. Selected by the `deliver` parameter and honored only when a
+/// consumer is first created (an existing durable consumer resumes from its
+/// stored cursor regardless).
+///
+/// `ByStartSeq`/`ByStartTime` reuse the `start_seq`/`start_time` parameters,
+/// resolved to the concrete policy in [`DeliverSpec::into_policy`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeliverSpec {
+    All,
+    New,
+    Last,
+    ByStartSeq,
+    ByStartTime,
+}
+
+impl DeliverSpec {
+    /// Parse the `deliver` parameter. Unknown values are rejected.
+    fn parse(value: &str) -> Result<Self, ScanError> {
+        match value {
+            "all" => Ok(Self::All),
+            "new" => Ok(Self::New),
+            "last" => Ok(Self::Last),
+            "by_start_seq" => Ok(Self::ByStartSeq),
+            "by_start_time" => Ok(Self::ByStartTime),
+            other => Err(ScanError::InvalidDeliver {
+                value: other.to_string(),
+            }),
+        }
+    }
+
+    /// Resolve to a concrete JetStream [`DeliverPolicy`], pulling the start
+    /// sequence/time from the parameters the `by_start_*` variants depend on.
+    ///
+    /// `start_time_micros` is epoch microseconds (DuckDB TIMESTAMP, treated as
+    /// UTC); it is converted to the `OffsetDateTime` the policy requires.
+    fn into_policy(
+        self,
+        start_seq: Option<u64>,
+        start_time_micros: Option<i64>,
+    ) -> Result<jetstream::consumer::DeliverPolicy, ScanError> {
+        use jetstream::consumer::DeliverPolicy;
+        match self {
+            Self::All => Ok(DeliverPolicy::All),
+            Self::New => Ok(DeliverPolicy::New),
+            Self::Last => Ok(DeliverPolicy::Last),
+            Self::ByStartSeq => {
+                let start_sequence = start_seq.ok_or(ScanError::DeliverNeedsStartSeq)?;
+                Ok(DeliverPolicy::ByStartSequence { start_sequence })
+            }
+            Self::ByStartTime => {
+                let micros = start_time_micros.ok_or(ScanError::DeliverNeedsStartTime)?;
+                let nanos = (micros as i128) * 1_000;
+                let start_time = time::OffsetDateTime::from_unix_timestamp_nanos(nanos)
+                    .map_err(|_| ScanError::DeliverNeedsStartTime)?;
+                Ok(DeliverPolicy::ByStartTime { start_time })
+            }
+        }
+    }
 }
 
 /// Parsed configuration for a scan-mode `read_nats` call.
-///
-/// Consumer-mode and decode parameters are declared in
-/// [`ReadNats::named_parameters`] but not yet interpreted.
 struct ReadNatsBindData {
     stream: String,
     url: String,
@@ -93,17 +170,23 @@ struct ReadNatsBindData {
     /// True when the read uses an ephemeral JetStream consumer instead of the
     /// stateless Direct Get scan path.
     ephemeral: bool,
+    /// Durable consumer name, if the read uses durable mode. Mutually exclusive
+    /// with `ephemeral`.
+    durable: Option<String>,
     /// Consumer + runtime created during bind (for cardinality), moved out by
     /// init. `Mutex<Option<_>>` because bind data is only borrowed as `&`.
     consumer_setup: Mutex<Option<ConsumerSetup>>,
 }
 
-/// The ephemeral consumer and the runtime that owns it, created in bind so the
-/// consumer's `num_pending` can be reported as query cardinality.
+/// A pull consumer (ephemeral or durable) and the runtime that owns it, created
+/// in bind so the consumer's `num_pending` can be reported as query
+/// cardinality.
 struct ConsumerSetup {
     runtime: Runtime,
     consumer: jetstream::consumer::PullConsumer,
     pending: u64,
+    /// Whether to ack each message on emit (durable + `ack => true`).
+    ack: bool,
 }
 
 /// Execution state, shared across DuckDB worker threads via the init data's
@@ -142,13 +225,17 @@ enum Source {
         /// Last sequence to fetch (inclusive).
         end_seq: u64,
     },
-    /// Bounded drain of an ephemeral pull consumer, up to the messages that
-    /// existed when the consumer was created.
+    /// Bounded drain of a pull consumer (ephemeral or durable), up to the
+    /// messages that existed when the consumer was created.
     Consumer {
         consumer: jetstream::consumer::PullConsumer,
         /// Messages left to drain (from the consumer's `num_pending` at
         /// creation). Reaching zero ends the read.
         remaining: u64,
+        /// Ack each message on emit (durable + `ack => true`), advancing the
+        /// stored cursor. At-least-once: a query cancelled mid-drain leaves
+        /// un-acked messages for redelivery on the next run.
+        ack: bool,
     },
 }
 
@@ -276,18 +363,61 @@ impl VTab for ReadNats {
             .get_named_parameter("ephemeral")
             .map(|v| v.to_bool())
             .unwrap_or(false);
+        let durable = bind
+            .get_named_parameter("durable")
+            .map(|v| v.to_string())
+            .filter(|s| !s.is_empty());
+        let ack = bind
+            .get_named_parameter("ack")
+            .map(|v| v.to_bool())
+            .unwrap_or(false);
 
-        // For consumer mode, create the ephemeral consumer now (in bind) so we
-        // can report its `num_pending` as the query cardinality. This drives
-        // DuckDB's built-in query progress bar. The consumer handle and the
-        // runtime that owns it are carried forward to init/func.
-        let consumer_setup = if ephemeral {
+        // Mode validation: durable and ephemeral cannot both be requested, and
+        // ack only makes sense for a durable (persisted-cursor) consumer.
+        if ephemeral && durable.is_some() {
+            return Err(Box::new(ScanError::ModeConflict));
+        }
+        if ack && durable.is_none() {
+            return Err(Box::new(ScanError::AckRequiresDurable));
+        }
+
+        // The `deliver` policy selects a consumer's starting point at creation.
+        // It only applies to consumer modes; `by_start_*` reuse start_seq/time.
+        let deliver = bind
+            .get_named_parameter("deliver")
+            .map(|v| DeliverSpec::parse(&v.to_string()))
+            .transpose()?;
+
+        // For consumer mode, create the consumer now (in bind) so we can report
+        // its `num_pending` as the query cardinality, driving DuckDB's progress
+        // bar. The consumer handle and the runtime that owns it are carried
+        // forward to init/func.
+        //
+        // Note: creating a durable consumer persists server-side state, and bind
+        // runs even for EXPLAIN, so `EXPLAIN SELECT ... durable => 'x'` will
+        // create the durable. This mirrors the ephemeral path (which likewise
+        // creates its consumer in bind) and is the pragmatic trade-off for
+        // cardinality reporting, since `set_cardinality` is bind-only.
+        let consumer_setup = if ephemeral || durable.is_some() {
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(1)
                 .enable_all()
                 .build()?;
-            let (consumer, pending) =
-                runtime.block_on(create_ephemeral_consumer(&url, &stream, subject.as_deref()))?;
+
+            // Default deliver policy is All (everything currently in the stream),
+            // matching the previous ephemeral behavior.
+            let deliver_policy = deliver
+                .unwrap_or(DeliverSpec::All)
+                .into_policy(start_seq, start_time_micros)?;
+
+            let (consumer, pending) = runtime.block_on(create_consumer(
+                &url,
+                &stream,
+                subject.as_deref(),
+                durable.as_deref(),
+                deliver_policy,
+                ack,
+            ))?;
             // num_pending is a point-in-time snapshot taken when the consumer was
             // created, not a guarantee, so report it as an estimate (is_exact =
             // false). This still drives the progress bar while avoiding an
@@ -297,6 +427,7 @@ impl VTab for ReadNats {
                 runtime,
                 consumer,
                 pending,
+                ack,
             })
         } else {
             None
@@ -314,6 +445,7 @@ impl VTab for ReadNats {
             proto_descriptor,
             proto_fields,
             ephemeral,
+            durable,
             consumer_setup: Mutex::new(consumer_setup),
         })
     }
@@ -321,14 +453,15 @@ impl VTab for ReadNats {
     fn init(info: &InitInfo) -> Result<Self::InitData, Box<dyn Error>> {
         let bind_data = unsafe { &*info.get_bind_data::<ReadNatsBindData>() };
 
-        // Consumer mode: reuse the runtime + consumer created during bind.
-        if bind_data.ephemeral {
+        // Consumer mode (ephemeral or durable): reuse the runtime + consumer
+        // created during bind.
+        if bind_data.ephemeral || bind_data.durable.is_some() {
             let setup = bind_data
                 .consumer_setup
                 .lock()
                 .unwrap()
                 .take()
-                .expect("ephemeral consumer setup missing from bind data");
+                .expect("consumer setup missing from bind data");
 
             let state = ScanState {
                 stream_name: bind_data.stream.clone(),
@@ -342,6 +475,7 @@ impl VTab for ReadNats {
                 source: Source::Consumer {
                     consumer: setup.consumer,
                     remaining: setup.pending,
+                    ack: setup.ack,
                 },
             };
 
@@ -511,9 +645,11 @@ impl VTab for ReadNats {
             Source::Consumer {
                 consumer,
                 remaining,
+                ack,
             } => {
                 use futures_util::StreamExt;
 
+                let ack = *ack;
                 let want = (*remaining).min(VECTOR_SIZE as u64) as usize;
                 if want > 0 {
                     // PERF: one `fetch` request per func call (per output vector).
@@ -534,6 +670,18 @@ impl VTab for ReadNats {
                                     ),
                                     Err(_) => (0, 0),
                                 };
+                                // Ack-on-emit (durable + ack => true). This is
+                                // at-least-once: the ack advances the stored
+                                // cursor as the row is drained, before it is
+                                // handed to DuckDB, so a query cancelled after
+                                // this point still counts the message as
+                                // consumed. Messages drained but not yet acked
+                                // (a crash between fetch and ack) are redelivered
+                                // on the next run. Ack failures are ignored; the
+                                // message is simply redelivered later.
+                                if ack {
+                                    let _ = msg.ack().await;
+                                }
                                 out.push((
                                     msg.subject.to_string(),
                                     seq,
@@ -662,16 +810,28 @@ pub unsafe fn extension_entrypoint(con: Connection) -> Result<(), Box<dyn Error>
     Ok(())
 }
 
-/// Connect and create an ephemeral pull consumer that will deliver every
-/// message currently in the stream (`DeliverPolicy::All`), optionally filtered
+/// Connect and create a pull consumer for a bounded drain, optionally filtered
 /// by subject server-side. Returns the consumer and its `num_pending` count at
 /// creation, which bounds the drain and drives the query progress bar.
-async fn create_ephemeral_consumer(
+///
+/// When `durable_name` is `Some`, the consumer is persisted server-side and
+/// resumes from its stored cursor on subsequent runs; `create_consumer` is
+/// idempotent, so an existing durable is attached rather than recreated (its
+/// `deliver_policy` is honored only at first creation). When `None`, an
+/// ephemeral consumer is created that is reaped shortly after the drain ends.
+///
+/// `ack` selects the ack policy: `Explicit` (durable + ack-on-emit, so the
+/// cursor advances only as messages are acknowledged) or `None` (the server
+/// treats delivered messages as consumed without explicit acks).
+async fn create_consumer(
     url: &str,
     stream_name: &str,
     subject: Option<&str>,
+    durable_name: Option<&str>,
+    deliver_policy: jetstream::consumer::DeliverPolicy,
+    ack: bool,
 ) -> Result<(jetstream::consumer::PullConsumer, u64), ScanError> {
-    use async_nats::jetstream::consumer::{pull, AckPolicy, DeliverPolicy};
+    use async_nats::jetstream::consumer::{pull, AckPolicy};
 
     let client = async_nats::connect(url)
         .await
@@ -689,13 +849,25 @@ async fn create_ephemeral_consumer(
             source: Box::new(e),
         })?;
 
+    let is_durable = durable_name.is_some();
+    let ack_policy = if ack {
+        AckPolicy::Explicit
+    } else {
+        AckPolicy::None
+    };
+
     let config = pull::Config {
-        durable_name: None, // ephemeral
-        deliver_policy: DeliverPolicy::All,
-        ack_policy: AckPolicy::None,
+        durable_name: durable_name.map(|s| s.to_string()),
+        deliver_policy,
+        ack_policy,
         filter_subject: subject.unwrap_or("").to_string(),
-        // Reap the server-side consumer shortly after we stop draining.
-        inactive_threshold: std::time::Duration::from_secs(30),
+        // Ephemeral consumers are reaped shortly after the drain ends. Durable
+        // consumers persist (that is the point), so no inactivity reaping.
+        inactive_threshold: if is_durable {
+            std::time::Duration::ZERO
+        } else {
+            std::time::Duration::from_secs(30)
+        },
         ..Default::default()
     };
 
@@ -903,7 +1075,8 @@ fn parse_timestamp_micros(s: &str) -> Result<i64, ScanError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{json_extract_string, parse_timestamp_micros, subject_matches};
+    use super::{json_extract_string, parse_timestamp_micros, subject_matches, DeliverSpec};
+    use async_nats::jetstream::consumer::DeliverPolicy;
 
     #[test]
     fn exact_match() {
@@ -1001,5 +1174,69 @@ mod tests {
         assert_eq!(json_extract_string(&doc, "missing"), None);
         assert_eq!(json_extract_string(&doc, "a.deeper"), None);
         assert_eq!(json_extract_string(&doc, "n"), None);
+    }
+
+    #[test]
+    fn deliver_spec_parses_known_values() {
+        assert_eq!(DeliverSpec::parse("all").unwrap(), DeliverSpec::All);
+        assert_eq!(DeliverSpec::parse("new").unwrap(), DeliverSpec::New);
+        assert_eq!(DeliverSpec::parse("last").unwrap(), DeliverSpec::Last);
+        assert_eq!(
+            DeliverSpec::parse("by_start_seq").unwrap(),
+            DeliverSpec::ByStartSeq
+        );
+        assert_eq!(
+            DeliverSpec::parse("by_start_time").unwrap(),
+            DeliverSpec::ByStartTime
+        );
+    }
+
+    #[test]
+    fn deliver_spec_rejects_unknown() {
+        assert!(DeliverSpec::parse("newest").is_err());
+        assert!(DeliverSpec::parse("").is_err());
+    }
+
+    #[test]
+    fn deliver_spec_simple_policies_ignore_params() {
+        assert!(matches!(
+            DeliverSpec::All.into_policy(None, None).unwrap(),
+            DeliverPolicy::All
+        ));
+        assert!(matches!(
+            DeliverSpec::New.into_policy(Some(5), Some(1)).unwrap(),
+            DeliverPolicy::New
+        ));
+        assert!(matches!(
+            DeliverSpec::Last.into_policy(None, None).unwrap(),
+            DeliverPolicy::Last
+        ));
+    }
+
+    #[test]
+    fn deliver_spec_by_start_seq_uses_start_seq() {
+        match DeliverSpec::ByStartSeq.into_policy(Some(42), None).unwrap() {
+            DeliverPolicy::ByStartSequence { start_sequence } => assert_eq!(start_sequence, 42),
+            other => panic!("expected ByStartSequence, got {other:?}"),
+        }
+        // Missing start_seq is an error.
+        assert!(DeliverSpec::ByStartSeq.into_policy(None, None).is_err());
+    }
+
+    #[test]
+    fn deliver_spec_by_start_time_uses_start_time() {
+        // 2030-01-01 00:00:00 UTC == 1_893_456_000_000_000 micros.
+        let micros = 1_893_456_000_000_000;
+        match DeliverSpec::ByStartTime
+            .into_policy(None, Some(micros))
+            .unwrap()
+        {
+            DeliverPolicy::ByStartTime { start_time } => {
+                assert_eq!(start_time.unix_timestamp_nanos(), (micros as i128) * 1_000);
+            }
+            other => panic!("expected ByStartTime, got {other:?}"),
+        }
+        // Missing start_time is an error.
+        assert!(DeliverSpec::ByStartTime.into_policy(None, None).is_err());
     }
 }
