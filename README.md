@@ -54,6 +54,8 @@ bar, and apply the subject filter server-side.
 | `end_time`      | TIMESTAMP | End time (inclusive). Scan mode.                                                                        |
 | `deliver`       | VARCHAR   | Starting point for a new consumer: `all` (default), `new`, `last`, `by_start_seq`, `by_start_time`. Honored only when the consumer is first created. Consumer modes. |
 | `ack`           | BOOLEAN   | Ack each message on emit, advancing the durable cursor (at-least-once). Default `false`. Durable mode. |
+| `batch`         | UBIGINT   | Messages requested per `fetch` while draining. Default `256`. Consumer modes.                          |
+| `max_messages`  | UBIGINT   | Hard cap on the number of rows returned. Consumer modes.                                               |
 | `json_extract`  | VARCHAR[] | JSON field paths, each mapped to a VARCHAR column.                                                      |
 | `proto_file`    | VARCHAR   | Path to a `.proto` schema file.                                                                         |
 | `proto_message` | VARCHAR   | Message type name within the schema.                                                                    |
@@ -61,7 +63,7 @@ bar, and apply the subject filter server-side.
 
 `json_extract` and `proto_extract` cannot be used together. `proto_extract` requires both
 `proto_file` and `proto_message`. `durable` and `ephemeral` cannot be used together, and `ack`
-requires `durable`.
+requires `durable`. `batch` and `max_messages` apply only to consumer modes.
 
 ```sql
 -- Scan a sequence range
@@ -73,6 +75,9 @@ SELECT count(*) FROM read_nats('ORDERS', ephemeral => true);
 
 -- Durable consumer: each run reads only new messages and acks them
 SELECT * FROM read_nats('ORDERS', durable => 'nightly_etl', ack => true);
+
+-- Cap the drain and tune the fetch batch size
+SELECT * FROM read_nats('ORDERS', ephemeral => true, max_messages => 1000, batch => 500);
 
 -- Filter by subject and extract JSON fields as columns
 SELECT "order.id", total

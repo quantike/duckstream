@@ -37,6 +37,31 @@ const VECTOR_SIZE: usize = 2048;
 /// Default NATS server URL when the `url` parameter is not provided.
 const DEFAULT_URL: &str = "nats://localhost:4222";
 
+/// Default consumer fetch batch size (messages per `fetch` request) when the
+/// `batch` parameter is not provided. Applies to ephemeral and durable modes.
+const DEFAULT_BATCH: u64 = 256;
+
+/// Apply the optional `max_messages` hard cap to a consumer's pending count.
+///
+/// Returns the number of messages the drain should emit: `pending` when no cap
+/// is set, otherwise `min(pending, cap)`. This is both the drain bound and the
+/// reported query cardinality.
+fn capped_pending(pending: u64, max_messages: Option<u64>) -> u64 {
+    match max_messages {
+        Some(cap) => pending.min(cap),
+        None => pending,
+    }
+}
+
+/// Compute the number of messages to request in a single consumer `fetch`.
+///
+/// A `func` call emits at most one output vector, so the fetch is bounded by
+/// the smallest of: messages still owed (`remaining`, already capped by
+/// `max_messages`), the user-requested `batch` size, and DuckDB's vector size.
+fn fetch_want(remaining: u64, batch: u64, vector_size: usize) -> usize {
+    remaining.min(batch).min(vector_size as u64) as usize
+}
+
 /// Errors surfaced from the NATS/JetStream layer.
 ///
 /// These are converted to `Box<dyn Error>` at the [`VTab`] boundary, which
@@ -75,6 +100,10 @@ enum ScanError {
     ModeConflict,
     #[error("ack requires durable mode (ack => true only applies to durable consumers)")]
     AckRequiresDurable,
+    #[error("{param} requires a consumer mode (set ephemeral => true or durable => 'name')")]
+    ConsumerOnlyParam { param: &'static str },
+    #[error("batch must be greater than zero")]
+    ZeroBatch,
     #[error(
         "invalid deliver policy '{value}' (expected all, new, last, by_start_seq, by_start_time)"
     )]
@@ -187,6 +216,8 @@ struct ConsumerSetup {
     pending: u64,
     /// Whether to ack each message on emit (durable + `ack => true`).
     ack: bool,
+    /// Messages requested per `fetch` (the `batch` parameter).
+    batch: u64,
 }
 
 /// Execution state, shared across DuckDB worker threads via the init data's
@@ -229,9 +260,13 @@ enum Source {
     /// messages that existed when the consumer was created.
     Consumer {
         consumer: jetstream::consumer::PullConsumer,
-        /// Messages left to drain (from the consumer's `num_pending` at
-        /// creation). Reaching zero ends the read.
+        /// Messages left to drain. Seeded from the consumer's `num_pending` at
+        /// creation, capped by `max_messages` when set. Reaching zero ends the
+        /// read.
         remaining: u64,
+        /// Messages requested per `fetch` request (the `batch` parameter),
+        /// clamped each call to whatever is still `remaining`.
+        batch: u64,
         /// Ack each message on emit (durable + `ack => true`), advancing the
         /// stored cursor. At-least-once: a query cancelled mid-drain leaves
         /// un-acked messages for redelivery on the next run.
@@ -372,6 +407,16 @@ impl VTab for ReadNats {
             .map(|v| v.to_bool())
             .unwrap_or(false);
 
+        // `batch` (fetch request size) and `max_messages` (hard row cap) only
+        // apply to consumer modes; the scan path fetches one message per
+        // Direct Get and reads the full requested range.
+        let batch = bind.get_named_parameter("batch").map(|v| v.to_uint64());
+        let max_messages = bind
+            .get_named_parameter("max_messages")
+            .map(|v| v.to_uint64());
+
+        let is_consumer = ephemeral || durable.is_some();
+
         // Mode validation: durable and ephemeral cannot both be requested, and
         // ack only makes sense for a durable (persisted-cursor) consumer.
         if ephemeral && durable.is_some() {
@@ -380,6 +425,18 @@ impl VTab for ReadNats {
         if ack && durable.is_none() {
             return Err(Box::new(ScanError::AckRequiresDurable));
         }
+        if batch.is_some() && !is_consumer {
+            return Err(Box::new(ScanError::ConsumerOnlyParam { param: "batch" }));
+        }
+        if max_messages.is_some() && !is_consumer {
+            return Err(Box::new(ScanError::ConsumerOnlyParam {
+                param: "max_messages",
+            }));
+        }
+        if batch == Some(0) {
+            return Err(Box::new(ScanError::ZeroBatch));
+        }
+        let batch = batch.unwrap_or(DEFAULT_BATCH);
 
         // The `deliver` policy selects a consumer's starting point at creation.
         // It only applies to consumer modes; `by_start_*` reuse start_seq/time.
@@ -422,12 +479,17 @@ impl VTab for ReadNats {
             // created, not a guarantee, so report it as an estimate (is_exact =
             // false). This still drives the progress bar while avoiding an
             // overconfident cardinality that could mislead join planning.
+            //
+            // `max_messages` caps the drain (and the reported cardinality): the
+            // read stops after at most that many rows even if more are pending.
+            let pending = capped_pending(pending, max_messages);
             bind.set_cardinality(pending, false);
             Some(ConsumerSetup {
                 runtime,
                 consumer,
                 pending,
                 ack,
+                batch,
             })
         } else {
             None
@@ -475,6 +537,7 @@ impl VTab for ReadNats {
                 source: Source::Consumer {
                     consumer: setup.consumer,
                     remaining: setup.pending,
+                    batch: setup.batch,
                     ack: setup.ack,
                 },
             };
@@ -645,12 +708,17 @@ impl VTab for ReadNats {
             Source::Consumer {
                 consumer,
                 remaining,
+                batch,
                 ack,
             } => {
                 use futures_util::StreamExt;
 
                 let ack = *ack;
-                let want = (*remaining).min(VECTOR_SIZE as u64) as usize;
+                // A func call emits at most one output vector, so the fetch is
+                // bounded by whichever is smallest: the messages still owed
+                // (`remaining`, already capped by `max_messages`), the
+                // user-requested `batch` size, and DuckDB's vector size.
+                let want = fetch_want(*remaining, *batch, VECTOR_SIZE);
                 if want > 0 {
                     // PERF: one `fetch` request per func call (per output vector).
                     // Fine for bounded drains, but each request has round-trip
@@ -660,9 +728,8 @@ impl VTab for ReadNats {
                         let mut out = Vec::with_capacity(want);
                         // `fetch` uses no_wait: returns what is available now and
                         // ends, so this drains without blocking indefinitely.
-                        if let Ok(mut batch) = consumer.fetch().max_messages(want).messages().await
-                        {
-                            while let Some(Ok(msg)) = batch.next().await {
+                        if let Ok(mut msgs) = consumer.fetch().max_messages(want).messages().await {
+                            while let Some(Ok(msg)) = msgs.next().await {
                                 let (seq, ts_micros) = match msg.info() {
                                     Ok(info) => (
                                         info.stream_sequence,
@@ -1075,8 +1142,38 @@ fn parse_timestamp_micros(s: &str) -> Result<i64, ScanError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{json_extract_string, parse_timestamp_micros, subject_matches, DeliverSpec};
+    use super::{
+        capped_pending, fetch_want, json_extract_string, parse_timestamp_micros, subject_matches,
+        DeliverSpec, DEFAULT_BATCH,
+    };
     use async_nats::jetstream::consumer::DeliverPolicy;
+
+    #[test]
+    fn max_messages_caps_pending() {
+        // No cap leaves the pending count untouched.
+        assert_eq!(capped_pending(1000, None), 1000);
+        // A cap below pending clamps the drain.
+        assert_eq!(capped_pending(1000, Some(10)), 10);
+        // A cap at or above pending is a no-op.
+        assert_eq!(capped_pending(5, Some(5)), 5);
+        assert_eq!(capped_pending(5, Some(100)), 5);
+        // A zero cap yields an empty drain.
+        assert_eq!(capped_pending(1000, Some(0)), 0);
+    }
+
+    #[test]
+    fn fetch_want_is_bounded_by_the_smallest_limit() {
+        // Batch is the binding constraint (smaller than remaining and vector).
+        assert_eq!(fetch_want(1000, DEFAULT_BATCH, 2048), 256);
+        // Remaining is the binding constraint (near the end of a drain).
+        assert_eq!(fetch_want(10, DEFAULT_BATCH, 2048), 10);
+        // The vector size caps an oversized batch.
+        assert_eq!(fetch_want(1_000_000, 100_000, 2048), 2048);
+        // Nothing left to fetch.
+        assert_eq!(fetch_want(0, DEFAULT_BATCH, 2048), 0);
+        // A batch of one requests a single message at a time.
+        assert_eq!(fetch_want(1000, 1, 2048), 1);
+    }
 
     #[test]
     fn exact_match() {
