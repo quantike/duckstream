@@ -10,7 +10,9 @@ EXTENSION_NAME=duckstream
 USE_UNSTABLE_C_API=1
 
 # Target DuckDB version. Must match the DuckDB version encoded by the duckdb
-# crate (see Cargo.toml) and the extension-ci-tools submodule branch.
+# crate (see Cargo.toml). The extension-ci-tools submodule tracks the codenamed
+# branch that supports this version (v1.5-variegata for DuckDB v1.5.x); keep it
+# in step with ci_tools_version in .github/workflows/MainDistributionPipeline.yml.
 TARGET_DUCKDB_VERSION=v1.5.4
 
 all: configure debug
