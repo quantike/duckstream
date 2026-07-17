@@ -1,21 +1,13 @@
 //! duckstream: a DuckDB extension for querying NATS JetStream.
 //!
-//! Step 2 implements **scan mode** of the `read_nats` table function: a
-//! stateless, bounded read of a JetStream stream by sequence range using the
-//! JetStream Direct Get API. Consumer modes (ephemeral/durable) and
-//! `read_nats_tail` are added in later steps.
+//! The `read_nats` table function is a bounded read with three modes: a
+//! stateless Direct Get scan by sequence/time range, and ephemeral or durable
+//! pull-consumer drains (see the crate README for the SQL contract).
 //!
-//! Scan mode does not need the full async→sync bridge (background task +
-//! bounded channel) that unbounded tail requires. It owns a Tokio runtime in
-//! its init data and drives a simple sequential `direct_get` loop with
-//! `Runtime::block_on` from the synchronous `func` callback.
-//!
-//! Consumer mode covers both ephemeral (`ephemeral => true`, a throwaway pull
-//! consumer) and durable (`durable => 'name'`, a server-persisted cursor that
-//! resumes across runs). Both drain a JetStream pull consumer up to its
-//! `num_pending` at creation; durable adds `ack => true` for at-least-once
-//! cursor advancement and a `deliver` policy that selects the starting point at
-//! first creation.
+//! These bounded modes do not need the full async→sync bridge (background task +
+//! bounded channel) that unbounded tail will require: each mode owns a Tokio
+//! runtime in its init data and drives it with `Runtime::block_on` from the
+//! synchronous `func` callback.
 
 use std::error::Error;
 use std::sync::Mutex;
@@ -319,8 +311,6 @@ impl VTab for ReadNats {
             }
         }
 
-        // Compile the proto schema (if any) and resolve each extract path to a
-        // typed column at bind time.
         let (proto_descriptor, proto_fields) = if using_proto {
             let file = proto_file.as_deref().unwrap();
             let message = proto_message.as_deref().unwrap();
@@ -349,14 +339,11 @@ impl VTab for ReadNats {
         };
         bind.add_result_column("payload", payload_type);
 
-        // Extracted JSON fields become extra VARCHAR columns named by the
-        // verbatim field path (dots preserved; nested values render as JSON).
+        // Extra columns are named by the verbatim field path, dots preserved
+        // (e.g. `order.id`), so callers quote them in SQL.
         for field in &json_fields {
             bind.add_result_column(field, varchar());
         }
-
-        // Extracted protobuf fields become extra columns with the schema-derived
-        // DuckDB type, named by the verbatim field path.
         for field in &proto_fields {
             bind.add_result_column(&field.path, LogicalTypeHandle::from(field.column_type));
         }
@@ -417,8 +404,6 @@ impl VTab for ReadNats {
 
         let is_consumer = ephemeral || durable.is_some();
 
-        // Mode validation: durable and ephemeral cannot both be requested, and
-        // ack only makes sense for a durable (persisted-cursor) consumer.
         if ephemeral && durable.is_some() {
             return Err(Box::new(ScanError::ModeConflict));
         }
@@ -461,8 +446,7 @@ impl VTab for ReadNats {
                 .enable_all()
                 .build()?;
 
-            // Default deliver policy is All (everything currently in the stream),
-            // matching the previous ephemeral behavior.
+            // Default to All: drain everything currently in the stream.
             let deliver_policy = deliver
                 .unwrap_or(DeliverSpec::All)
                 .into_policy(start_seq, start_time_micros)?;
@@ -554,8 +538,8 @@ impl VTab for ReadNats {
             .enable_all()
             .build()?;
 
-        // Connect and resolve the effective sequence window up front (fail fast
-        // on a bad URL or unknown stream, mirroring the C++ extension).
+        // Resolve the effective sequence window up front so a bad URL or
+        // unknown stream fails the query at init rather than mid-scan.
         let state = runtime.block_on(async {
             let client = async_nats::connect(&bind_data.url)
                 .await
@@ -645,9 +629,8 @@ impl VTab for ReadNats {
             return Ok(());
         }
 
-        // Collect up to one vector's worth of rows from the active source. Each
-        // row is reduced to (subject, seq, ts_micros, payload) so the column
-        // writing below is identical regardless of source.
+        // Reduce each source's messages to a common (subject, seq, ts_micros,
+        // payload) row so the column-writing below is source-agnostic.
         //
         // PERF: this materializes an owned copy of every message (String subject
         // + Vec<u8> payload) into an intermediate Vec before writing to the
@@ -714,10 +697,6 @@ impl VTab for ReadNats {
                 use futures_util::StreamExt;
 
                 let ack = *ack;
-                // A func call emits at most one output vector, so the fetch is
-                // bounded by whichever is smallest: the messages still owed
-                // (`remaining`, already capped by `max_messages`), the
-                // user-requested `batch` size, and DuckDB's vector size.
                 let want = fetch_want(*remaining, *batch, VECTOR_SIZE);
                 if want > 0 {
                     // PERF: one `fetch` request per func call (per output vector).
@@ -737,15 +716,11 @@ impl VTab for ReadNats {
                                     ),
                                     Err(_) => (0, 0),
                                 };
-                                // Ack-on-emit (durable + ack => true). This is
-                                // at-least-once: the ack advances the stored
-                                // cursor as the row is drained, before it is
-                                // handed to DuckDB, so a query cancelled after
-                                // this point still counts the message as
-                                // consumed. Messages drained but not yet acked
-                                // (a crash between fetch and ack) are redelivered
-                                // on the next run. Ack failures are ignored; the
-                                // message is simply redelivered later.
+                                // At-least-once: acking before the row reaches
+                                // DuckDB means a query cancelled after this point
+                                // still counts the message as consumed. A crash
+                                // between fetch and ack (or an ignored ack error)
+                                // just redelivers on the next run.
                                 if ack {
                                     let _ = msg.ack().await;
                                 }
@@ -785,14 +760,11 @@ impl VTab for ReadNats {
         let mut ts_vec = output.flat_vector(3);
         let payload_vec = output.flat_vector(4);
 
-        // Extra columns for extracted JSON fields, in declared order after the
-        // five base columns.
+        // Extra columns follow the five base columns at index 5+. JSON and
+        // proto extraction are mutually exclusive, so both loops start at 5.
         let mut json_vecs: Vec<_> = (0..json_fields.len())
             .map(|i| output.flat_vector(5 + i))
             .collect();
-
-        // Extra columns for extracted protobuf fields (mutually exclusive with
-        // JSON, so they also begin at index 5).
         let mut proto_vecs: Vec<_> = (0..proto_fields.len())
             .map(|i| output.flat_vector(5 + i))
             .collect();
