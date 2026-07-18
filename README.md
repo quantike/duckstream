@@ -60,10 +60,16 @@ bar, and apply the subject filter server-side.
 | `proto_file`    | VARCHAR   | Path to a `.proto` schema file.                                                                         |
 | `proto_message` | VARCHAR   | Message type name within the schema.                                                                    |
 | `proto_extract` | VARCHAR[] | Protobuf field paths, each mapped to a schema-typed column.                                             |
+| `ignore_errors` | BOOLEAN   | When `true`, payloads that fail to decode leave the extracted columns NULL instead of failing the query. Default `false`. |
 
 `json_extract` and `proto_extract` cannot be used together. `proto_extract` requires both
 `proto_file` and `proto_message`. `durable` and `ephemeral` cannot be used together, and `ack`
 requires `durable`. `batch` and `max_messages` apply only to consumer modes.
+
+By default, a payload that does not match the chosen decoder fails the query, naming the stream and
+sequence and pointing at the other decoder. This catches pointing `json_extract` at a protobuf
+stream, or `proto_*` at a JSON stream. Set `ignore_errors => true` to tolerate mixed streams;
+undecodable rows are still emitted with NULL extracted columns.
 
 ```sql
 -- Scan a sequence range
