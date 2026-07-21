@@ -60,11 +60,19 @@ bar, and apply the subject filter server-side.
 | `proto_file`    | VARCHAR   | Path to a `.proto` schema file.                                                                         |
 | `proto_message` | VARCHAR   | Message type name within the schema.                                                                    |
 | `proto_extract` | VARCHAR[] | Protobuf field paths, each mapped to a schema-typed column.                                             |
+| `format`        | VARCHAR   | Type of the `payload` column: `blob` (default), `text`, or `json`. `json` emits VARCHAR aliased `JSON`, so the `json` extension operators (`->`, `->>`) apply without a cast. |
 | `ignore_errors` | BOOLEAN   | When `true`, payloads that fail to decode leave the extracted columns NULL instead of failing the query. Default `false`. |
 
 `json_extract` and `proto_extract` cannot be used together. `proto_extract` requires both
 `proto_file` and `proto_message`. `durable` and `ephemeral` cannot be used together, and `ack`
 requires `durable`. `batch` and `max_messages` apply only to consumer modes.
+
+`format` sets the type of the whole `payload` column and is independent of the `json_extract`/`proto_*`
+projections (which add their own columns), so it composes with either. `format => 'json'` on a JSON
+stream is lazy: bytes are emitted unparsed and DuckDB validates on access, except that `ignore_errors`
+drops clearly-non-JSON payloads to NULL. Supplying `proto_file`/`proto_message` with `format => 'json'`
+decodes each message and serializes it to the `payload` column (field names verbatim from the `.proto`),
+so `proto_extract` is not required in that case.
 
 By default, a payload that does not match the chosen decoder fails the query, naming the stream and
 sequence and pointing at the other decoder. This catches pointing `json_extract` at a protobuf
@@ -97,6 +105,10 @@ FROM read_jetstream('ORDERS',
     proto_file    => 'order.proto',
     proto_message => 'shop.Order',
     proto_extract => ['id', 'total']);
+
+-- Emit the payload as JSON and navigate it in SQL with -> / ->>
+SELECT payload->>'$.customer.name' AS customer, payload->>'$.total' AS total
+FROM read_jetstream('ORDERS', format => 'json');
 ```
 
 ## Building
