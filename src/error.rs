@@ -77,4 +77,6 @@ pub enum ScanError {
     StartNeedsStartSeq,
     #[error("start => 'by_start_time' requires start_time")]
     StartNeedsStartTime,
+    #[error("invalid format '{value}' (expected blob, text, or json)")]
+    InvalidFormat { value: String },
 }

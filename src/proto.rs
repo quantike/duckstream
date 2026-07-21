@@ -145,6 +145,25 @@ pub fn decode_message(descriptor: &MessageDescriptor, payload: &[u8]) -> Option<
     DynamicMessage::decode(descriptor.clone(), payload).ok()
 }
 
+/// Serialize an already-decoded message to JSON, for `format => 'json'` on a
+/// protobuf stream.
+///
+/// Field names are verbatim from the `.proto` (snake_case), so `->>` paths and
+/// `proto_extract` column names agree. Value encodings follow canonical
+/// proto-JSON: 64-bit integers as strings, `bytes` as base64, enums by name.
+/// `None` means serialization failed.
+pub fn message_to_json(message: &DynamicMessage) -> Option<String> {
+    use prost_reflect::SerializeOptions;
+
+    let options = SerializeOptions::new().use_proto_field_name(true);
+    let mut buf = Vec::new();
+    let mut serializer = serde_json::Serializer::new(&mut buf);
+    message
+        .serialize_with_options(&mut serializer, &options)
+        .ok()?;
+    String::from_utf8(buf).ok()
+}
+
 /// A typed value extracted from a decoded protobuf message, ready to be written
 /// into a DuckDB column. `None` variants and a missing path both mean SQL NULL.
 #[derive(Debug)]
@@ -346,5 +365,42 @@ mod tests {
             extract_value(&decoded, "missing"),
             ProtoValue::Null
         ));
+    }
+
+    #[test]
+    fn message_to_json_uses_verbatim_field_names() {
+        let desc = compile_test_schema();
+
+        let mut msg = DynamicMessage::new(desc.clone());
+        msg.set_field_by_name("id", Value::U64(99));
+        msg.set_field_by_name("amount", Value::F64(1.5));
+        msg.set_field_by_name("ok", Value::Bool(true));
+        msg.set_field_by_name("label", Value::String("hi".into()));
+        let inner_desc = desc.parent_pool().get_message_by_name("t.Inner").unwrap();
+        let mut inner = DynamicMessage::new(inner_desc);
+        inner.set_field_by_name("name", Value::String("deep".into()));
+        msg.set_field_by_name("inner", Value::Message(inner));
+
+        let bytes = {
+            use prost::Message as _;
+            msg.encode_to_vec()
+        };
+
+        let message = decode_message(&desc, &bytes).unwrap();
+        let json = message_to_json(&message).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed["label"], serde_json::json!("hi"));
+        assert_eq!(parsed["ok"], serde_json::json!(true));
+        assert_eq!(parsed["inner"]["name"], serde_json::json!("deep"));
+        // 64-bit integers serialize as strings (canonical proto-JSON).
+        assert_eq!(parsed["id"], serde_json::json!("99"));
+    }
+
+    #[test]
+    fn message_to_json_returns_none_on_garbage() {
+        let desc = compile_test_schema();
+        // A lone run of high continuation bytes is an invalid varint tag.
+        assert!(decode_message(&desc, &[0xff, 0xff, 0xff, 0xff]).is_none());
     }
 }

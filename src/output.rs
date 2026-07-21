@@ -85,6 +85,20 @@ pub fn non_proto_hint(payload: &[u8]) -> String {
     }
 }
 
+/// Text for a lazily-emitted `format => 'json'` payload, or `None` to write SQL
+/// NULL.
+///
+/// The bytes are emitted unparsed (DuckDB validates at query time). With
+/// `ignore_errors`, a payload whose lead byte does not open a JSON object/array
+/// is dropped to NULL so a mixed stream does not fail a scan. This is a lead-byte
+/// sniff, not a parse: subtly-malformed JSON still reaches DuckDB.
+pub fn json_payload_text(payload: &[u8], ignore_errors: bool) -> Option<&str> {
+    if ignore_errors && !looks_like_json(payload) {
+        return None;
+    }
+    std::str::from_utf8(payload).ok()
+}
+
 /// Whether the payload's first non-whitespace byte opens a JSON object or array.
 ///
 /// Protobuf decoding is permissive and often succeeds on JSON bytes, so this
@@ -101,7 +115,9 @@ fn lead_byte(payload: &[u8]) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{json_extract_string, looks_like_json, non_json_hint, non_proto_hint};
+    use super::{
+        json_extract_string, json_payload_text, looks_like_json, non_json_hint, non_proto_hint,
+    };
 
     #[test]
     fn json_scalar_extraction() {
@@ -173,5 +189,23 @@ mod tests {
         // A bare JSON string/number at top level is intentionally not sniffed.
         assert!(!looks_like_json(b"\"hello\""));
         assert!(!looks_like_json(b""));
+    }
+
+    #[test]
+    fn json_payload_text_passes_through_without_ignore() {
+        assert_eq!(json_payload_text(b"{\"a\":1}", false), Some("{\"a\":1}"));
+        assert_eq!(json_payload_text(b"not json", false), Some("not json"));
+    }
+
+    #[test]
+    fn json_payload_text_skips_non_json_under_ignore() {
+        assert_eq!(json_payload_text(b"\x0A\x26abc", true), None);
+        assert_eq!(json_payload_text(b"not json", true), None);
+        assert_eq!(json_payload_text(b"  [1,2]", true), Some("  [1,2]"));
+    }
+
+    #[test]
+    fn json_payload_text_rejects_invalid_utf8() {
+        assert_eq!(json_payload_text(&[0xff, 0xfe], false), None);
     }
 }
