@@ -24,10 +24,10 @@ targeting DuckDB v1.5.4.
 
 ## SQL API
 
-The extension registers the `read_nats` table function. It returns five base columns (`stream`,
+The extension registers the `read_jetstream` table function. It returns five base columns (`stream`,
 `subject`, `seq`, `ts_nats`, `payload`) plus one extra column per extracted JSON or protobuf field.
 
-### `read_nats(stream, ...)`
+### `read_jetstream(stream, ...)`
 
 A bounded read that always completes. It runs in one of three modes:
 
@@ -48,11 +48,11 @@ bar, and apply the subject filter server-side.
 | `ephemeral`     | BOOLEAN   | `true` reads via an ephemeral consumer instead of a scan. Default `false`.                              |
 | `durable`       | VARCHAR   | Consumer name. Selects durable mode. Mutually exclusive with `ephemeral`.                               |
 | `subject`       | VARCHAR   | NATS subject filter, wildcards allowed (`*`, `>`). Applied client-side in scan mode, server-side in consumer modes. |
-| `start_seq`     | UBIGINT   | Start sequence (inclusive). Scan mode, or `deliver => 'by_start_seq'`.                                  |
+| `start_seq`     | UBIGINT   | Start sequence (inclusive). Scan mode, or `start => 'by_start_seq'`.                                    |
 | `end_seq`       | UBIGINT   | End sequence (inclusive). Scan mode.                                                                    |
-| `start_time`    | TIMESTAMP | Start time (inclusive). Scan mode, or `deliver => 'by_start_time'`.                                     |
+| `start_time`    | TIMESTAMP | Start time (inclusive). Scan mode, or `start => 'by_start_time'`.                                       |
 | `end_time`      | TIMESTAMP | End time (inclusive). Scan mode.                                                                        |
-| `deliver`       | VARCHAR   | Starting point for a new consumer: `all` (default), `new`, `last`, `by_start_seq`, `by_start_time`. Honored only when the consumer is first created. Consumer modes. |
+| `start`         | VARCHAR   | Starting point for a new consumer: `all` (default), `new`, `last`, `by_start_seq`, `by_start_time`. Honored only when the consumer is first created. Consumer modes. |
 | `ack`           | BOOLEAN   | Ack each message on emit, advancing the durable cursor (at-least-once). Default `false`. Durable mode. |
 | `batch`         | UBIGINT   | Messages requested per `fetch` while draining. Default `256`. Consumer modes.                          |
 | `max_messages`  | UBIGINT   | Hard cap on the number of rows returned. Consumer modes.                                               |
@@ -74,26 +74,26 @@ undecodable rows are still emitted with NULL extracted columns.
 ```sql
 -- Scan a sequence range
 SELECT seq, subject, payload
-FROM read_nats('ORDERS', start_seq => 1, end_seq => 100);
+FROM read_jetstream('ORDERS', start_seq => 1, end_seq => 100);
 
 -- Ephemeral consumer: read everything currently in the stream (with a progress bar)
-SELECT count(*) FROM read_nats('ORDERS', ephemeral => true);
+SELECT count(*) FROM read_jetstream('ORDERS', ephemeral => true);
 
 -- Durable consumer: each run reads only new messages and acks them
-SELECT * FROM read_nats('ORDERS', durable => 'nightly_etl', ack => true);
+SELECT * FROM read_jetstream('ORDERS', durable => 'nightly_etl', ack => true);
 
 -- Cap the drain and tune the fetch batch size
-SELECT * FROM read_nats('ORDERS', ephemeral => true, max_messages => 1000, batch => 500);
+SELECT * FROM read_jetstream('ORDERS', ephemeral => true, max_messages => 1000, batch => 500);
 
 -- Filter by subject and extract JSON fields as columns
 SELECT "order.id", total
-FROM read_nats('ORDERS',
+FROM read_jetstream('ORDERS',
     subject      => 'orders.us.*',
     json_extract => ['order.id', 'total']);
 
 -- Extract protobuf fields with schema-derived types (no CAST needed)
 SELECT sum(total)
-FROM read_nats('ORDERS',
+FROM read_jetstream('ORDERS',
     proto_file    => 'order.proto',
     proto_message => 'shop.Order',
     proto_extract => ['id', 'total']);
@@ -128,7 +128,7 @@ duckdb -unsigned
 
 ```sql
 LOAD '/absolute/path/to/duckstream/build/debug/duckstream.duckdb_extension';
-SELECT * FROM read_nats('ORDERS');
+SELECT * FROM read_jetstream('ORDERS');
 ```
 
 Or preload it when launching from the repo root:
