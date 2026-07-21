@@ -24,10 +24,10 @@ targeting DuckDB v1.5.4.
 
 ## SQL API
 
-The extension registers the `read_nats` table function. It returns five base columns (`stream`,
+The extension registers the `read_jetstream` table function. It returns five base columns (`stream`,
 `subject`, `seq`, `ts_nats`, `payload`) plus one extra column per extracted JSON or protobuf field.
 
-### `read_nats(stream, ...)`
+### `read_jetstream(stream, ...)`
 
 A bounded read that always completes. It runs in one of three modes:
 
@@ -48,11 +48,11 @@ bar, and apply the subject filter server-side.
 | `ephemeral`     | BOOLEAN   | `true` reads via an ephemeral consumer instead of a scan. Default `false`.                              |
 | `durable`       | VARCHAR   | Consumer name. Selects durable mode. Mutually exclusive with `ephemeral`.                               |
 | `subject`       | VARCHAR   | NATS subject filter, wildcards allowed (`*`, `>`). Applied client-side in scan mode, server-side in consumer modes. |
-| `start_seq`     | UBIGINT   | Start sequence (inclusive). Scan mode, or `deliver => 'by_start_seq'`.                                  |
+| `start_seq`     | UBIGINT   | Start sequence (inclusive). Scan mode, or `start => 'by_start_seq'`.                                    |
 | `end_seq`       | UBIGINT   | End sequence (inclusive). Scan mode.                                                                    |
-| `start_time`    | TIMESTAMP | Start time (inclusive). Scan mode, or `deliver => 'by_start_time'`.                                     |
+| `start_time`    | TIMESTAMP | Start time (inclusive). Scan mode, or `start => 'by_start_time'`.                                       |
 | `end_time`      | TIMESTAMP | End time (inclusive). Scan mode.                                                                        |
-| `deliver`       | VARCHAR   | Starting point for a new consumer: `all` (default), `new`, `last`, `by_start_seq`, `by_start_time`. Honored only when the consumer is first created. Consumer modes. |
+| `start`         | VARCHAR   | Starting point for a new consumer: `all` (default), `new`, `last`, `by_start_seq`, `by_start_time`. Honored only when the consumer is first created. Consumer modes. |
 | `ack`           | BOOLEAN   | Ack each message on emit, advancing the durable cursor (at-least-once). Default `false`. Durable mode. |
 | `batch`         | UBIGINT   | Messages requested per `fetch` while draining. Default `256`. Consumer modes.                          |
 | `max_messages`  | UBIGINT   | Hard cap on the number of rows returned. Consumer modes.                                               |
@@ -60,37 +60,57 @@ bar, and apply the subject filter server-side.
 | `proto_file`    | VARCHAR   | Path to a `.proto` schema file.                                                                         |
 | `proto_message` | VARCHAR   | Message type name within the schema.                                                                    |
 | `proto_extract` | VARCHAR[] | Protobuf field paths, each mapped to a schema-typed column.                                             |
+| `format`        | VARCHAR   | Type of the `payload` column: `blob` (default), `text`, or `json`. `json` emits VARCHAR aliased `JSON`, so the `json` extension operators (`->`, `->>`) apply without a cast. |
+| `ignore_errors` | BOOLEAN   | When `true`, payloads that fail to decode leave the affected columns NULL instead of failing the query. Default `false`. |
 
 `json_extract` and `proto_extract` cannot be used together. `proto_extract` requires both
 `proto_file` and `proto_message`. `durable` and `ephemeral` cannot be used together, and `ack`
 requires `durable`. `batch` and `max_messages` apply only to consumer modes.
 
+`format` sets the type of the whole `payload` column and is independent of the `json_extract`/`proto_*`
+projections (which add their own columns), so it composes with either. `format => 'json'` on a JSON
+stream is lazy: bytes are emitted unparsed and DuckDB validates on access, except that `ignore_errors`
+drops clearly-non-JSON payloads to NULL. `format => 'text'` requires valid UTF-8; a non-UTF-8 payload
+fails the query unless `ignore_errors => true`, which drops it to NULL. Supplying
+`proto_file`/`proto_message` with `format => 'json'` decodes each message and serializes it to the
+`payload` column (field names verbatim from the `.proto`), so `proto_extract` is not required in that
+case.
+
+By default, a payload that does not match the chosen decoder fails the query, naming the stream and
+sequence and pointing at the other decoder. This catches pointing `json_extract` at a protobuf
+stream, or `proto_*` at a JSON stream. Set `ignore_errors => true` to tolerate mixed streams;
+undecodable rows are still emitted with NULL extracted columns.
+
 ```sql
 -- Scan a sequence range
 SELECT seq, subject, payload
-FROM read_nats('ORDERS', start_seq => 1, end_seq => 100);
+FROM read_jetstream('ORDERS', start_seq => 1, end_seq => 100);
 
 -- Ephemeral consumer: read everything currently in the stream (with a progress bar)
-SELECT count(*) FROM read_nats('ORDERS', ephemeral => true);
+SELECT count(*) FROM read_jetstream('ORDERS', ephemeral => true);
 
 -- Durable consumer: each run reads only new messages and acks them
-SELECT * FROM read_nats('ORDERS', durable => 'nightly_etl', ack => true);
+SELECT * FROM read_jetstream('ORDERS', durable => 'nightly_etl', ack => true);
 
 -- Cap the drain and tune the fetch batch size
-SELECT * FROM read_nats('ORDERS', ephemeral => true, max_messages => 1000, batch => 500);
+SELECT * FROM read_jetstream('ORDERS', ephemeral => true, max_messages => 1000, batch => 500);
 
 -- Filter by subject and extract JSON fields as columns
 SELECT "order.id", total
-FROM read_nats('ORDERS',
+FROM read_jetstream('ORDERS',
     subject      => 'orders.us.*',
     json_extract => ['order.id', 'total']);
 
 -- Extract protobuf fields with schema-derived types (no CAST needed)
 SELECT sum(total)
-FROM read_nats('ORDERS',
+FROM read_jetstream('ORDERS',
     proto_file    => 'order.proto',
     proto_message => 'shop.Order',
     proto_extract => ['id', 'total']);
+
+-- Emit the payload as JSON and navigate it in SQL with -> / ->>
+SELECT payload->>'$.customer.name' AS customer, payload->>'$.total' AS total
+FROM read_jetstream('ORDERS', format => 'json');
 ```
 
 ## Building
@@ -122,7 +142,7 @@ duckdb -unsigned
 
 ```sql
 LOAD '/absolute/path/to/duckstream/build/debug/duckstream.duckdb_extension';
-SELECT * FROM read_nats('ORDERS');
+SELECT * FROM read_jetstream('ORDERS');
 ```
 
 Or preload it when launching from the repo root:

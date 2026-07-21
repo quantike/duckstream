@@ -1,6 +1,6 @@
 [package]
 name = "duckstream"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "A DuckDB extension for querying NATS JetStream, including live/tail streaming"
 license = "MIT"
@@ -11,10 +11,11 @@ crate-type = ["cdylib"]
 
 [dependencies]
 async-nats = "0.49.1"
+bytes = "1.12.1"
 duckdb = { version = "~1.10504.0", features = ["loadable-extension", "vtab"] }
 futures-util = "0.3.32"
 prost = "0.14.4"
-prost-reflect = "0.16.5"
+prost-reflect = { version = "0.16.5", features = ["serde"] }
 protox = "0.9.1"
 serde_json = "1.0.150"
 thiserror = "2.0.18"
