@@ -1,4 +1,4 @@
-//! Runtime protobuf decoding for the `proto_extract` parameter of `read_nats`.
+//! Runtime protobuf decoding for the `proto_extract` parameter of `read_jetstream`.
 //!
 //! Unlike JSON extraction (which is schemaless and emits VARCHAR), a protobuf
 //! `.proto` schema is supplied at bind time, so each extracted field maps to a

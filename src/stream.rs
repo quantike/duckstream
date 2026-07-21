@@ -1,4 +1,4 @@
-//! Async NATS/JetStream I/O helpers for the bounded `read_nats` modes.
+//! Async JetStream stream and consumer I/O for the bounded `read_jetstream` modes.
 //!
 //! This module owns the network-touching operations the scan and consumer
 //! paths need: creating a pull consumer ([`create_consumer`]) and resolving a

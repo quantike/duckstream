@@ -1,6 +1,6 @@
 //! duckstream: a DuckDB extension for querying NATS JetStream.
 //!
-//! The `read_nats` table function is a bounded read with three modes: a
+//! The `read_jetstream` table function is a bounded read with three modes: a
 //! stateless Direct Get scan by sequence/time range, and ephemeral or durable
 //! pull-consumer drains (see the crate README for the SQL contract).
 //!
@@ -13,13 +13,13 @@
 //!
 //! `lib.rs` holds only the DuckDB [`VTab`] glue (bind/init/func, parameter
 //! declarations) and the C-API entrypoint. The reusable surfaces live in
-//! focused modules so upcoming work (notably `read_nats_tail`) can build on
+//! focused modules so upcoming work (notably `read_jetstream_tail`) can build on
 //! them:
 //!
 //! - [`error`]: the [`ScanError`](error::ScanError) type shared across modes.
-//! - [`config`]: pure parameter parsing/validation ([`DeliverSpec`](config::DeliverSpec),
+//! - [`config`]: pure parameter parsing/validation ([`StartSpec`](config::StartSpec),
 //!   subject matching, timestamp parsing).
-//! - [`nats`]: async JetStream I/O (consumer creation, time→sequence resolution).
+//! - [`stream`]: async JetStream stream/consumer I/O (consumer creation, time→sequence resolution).
 //! - [`row`]: the `Bytes`-backed [`Row`](row::Row) buffered between message
 //!   acquisition and column writing.
 //! - [`output`]: writing rows + extracted JSON/proto values into DuckDB vectors.
@@ -38,12 +38,12 @@ use tokio::runtime::Runtime;
 
 mod config;
 mod error;
-mod nats;
 mod output;
 mod proto;
 mod row;
+mod stream;
 
-use config::{parse_timestamp_micros, subject_matches, DeliverSpec};
+use config::{parse_timestamp_micros, subject_matches, StartSpec};
 use error::ScanError;
 use output::{
     json_extract_string, looks_like_json, non_json_hint, non_proto_hint, write_proto_value,
@@ -82,8 +82,8 @@ fn fetch_want(remaining: u64, batch: u64, vector_size: usize) -> usize {
     remaining.min(batch).min(vector_size as u64) as usize
 }
 
-/// Parsed configuration for a scan-mode `read_nats` call.
-struct ReadNatsBindData {
+/// Parsed configuration for a scan-mode `read_jetstream` call.
+struct ReadJetstreamBindData {
     stream: String,
     url: String,
     /// Optional NATS subject filter (token-based wildcards `*` and `>`).
@@ -132,7 +132,7 @@ struct ConsumerSetup {
 
 /// Execution state, shared across DuckDB worker threads via the init data's
 /// mutex.
-struct ReadNatsInitData {
+struct ReadJetstreamInitData {
     runtime: Runtime,
     inner: Mutex<ScanState>,
 }
@@ -190,12 +190,12 @@ enum Source {
     },
 }
 
-/// The `read_nats` table function. See the crate README for the full contract.
-struct ReadNats;
+/// The `read_jetstream` table function. See the crate README for the full contract.
+struct ReadJetstream;
 
-impl VTab for ReadNats {
-    type InitData = ReadNatsInitData;
-    type BindData = ReadNatsBindData;
+impl VTab for ReadJetstream {
+    type InitData = ReadJetstreamInitData;
+    type BindData = ReadJetstreamBindData;
 
     fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn Error>> {
         let varchar = || LogicalTypeHandle::from(LogicalTypeId::Varchar);
@@ -352,11 +352,11 @@ impl VTab for ReadNats {
         }
         let batch = batch.unwrap_or(DEFAULT_BATCH);
 
-        // The `deliver` policy selects a consumer's starting point at creation.
+        // The `start` policy selects a consumer's starting point at creation.
         // It only applies to consumer modes; `by_start_*` reuse start_seq/time.
-        let deliver = bind
-            .get_named_parameter("deliver")
-            .map(|v| DeliverSpec::parse(&v.to_string()))
+        let start = bind
+            .get_named_parameter("start")
+            .map(|v| StartSpec::parse(&v.to_string()))
             .transpose()?;
 
         // For consumer mode, create the consumer now (in bind) so we can report
@@ -376,11 +376,11 @@ impl VTab for ReadNats {
                 .build()?;
 
             // Default to All: drain everything currently in the stream.
-            let deliver_policy = deliver
-                .unwrap_or(DeliverSpec::All)
+            let deliver_policy = start
+                .unwrap_or(StartSpec::All)
                 .into_policy(start_seq, start_time_micros)?;
 
-            let (consumer, pending) = runtime.block_on(nats::create_consumer(
+            let (consumer, pending) = runtime.block_on(stream::create_consumer(
                 &url,
                 &stream,
                 subject.as_deref(),
@@ -408,7 +408,7 @@ impl VTab for ReadNats {
             None
         };
 
-        Ok(ReadNatsBindData {
+        Ok(ReadJetstreamBindData {
             stream,
             url,
             subject,
@@ -427,7 +427,7 @@ impl VTab for ReadNats {
     }
 
     fn init(info: &InitInfo) -> Result<Self::InitData, Box<dyn Error>> {
-        let bind_data = unsafe { &*info.get_bind_data::<ReadNatsBindData>() };
+        let bind_data = unsafe { &*info.get_bind_data::<ReadJetstreamBindData>() };
 
         // Consumer mode (ephemeral or durable): reuse the runtime + consumer
         // created during bind.
@@ -457,7 +457,7 @@ impl VTab for ReadNats {
                 },
             };
 
-            return Ok(ReadNatsInitData {
+            return Ok(ReadJetstreamInitData {
                 runtime: setup.runtime,
                 inner: Mutex::new(state),
             });
@@ -504,7 +504,7 @@ impl VTab for ReadNats {
                     .min(last_sequence);
 
                 if let Some(start_micros) = bind_data.start_time_micros {
-                    let resolved = nats::resolve_time_to_seq(
+                    let resolved = stream::resolve_time_to_seq(
                         &stream,
                         start_micros,
                         first_sequence,
@@ -521,7 +521,7 @@ impl VTab for ReadNats {
                 }
 
                 if let Some(end_micros) = bind_data.end_time_micros {
-                    let resolved = nats::resolve_time_to_seq(
+                    let resolved = stream::resolve_time_to_seq(
                         &stream,
                         end_micros,
                         first_sequence,
@@ -552,7 +552,7 @@ impl VTab for ReadNats {
                 })
             })?;
 
-        Ok(ReadNatsInitData {
+        Ok(ReadJetstreamInitData {
             runtime,
             inner: Mutex::new(state),
         })
@@ -781,7 +781,7 @@ impl VTab for ReadNats {
             ("end_seq".to_string(), ubigint()),
             ("start_time".to_string(), timestamp()),
             ("end_time".to_string(), timestamp()),
-            ("deliver".to_string(), varchar()),
+            ("start".to_string(), varchar()),
             ("ack".to_string(), boolean()),
             ("batch".to_string(), ubigint()),
             ("max_messages".to_string(), ubigint()),
@@ -796,7 +796,7 @@ impl VTab for ReadNats {
 
 #[duckdb_entrypoint_c_api]
 pub unsafe fn extension_entrypoint(con: Connection) -> Result<(), Box<dyn Error>> {
-    con.register_table_function::<ReadNats>("read_nats")?;
+    con.register_table_function::<ReadJetstream>("read_jetstream")?;
     Ok(())
 }
 

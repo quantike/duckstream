@@ -70,11 +70,11 @@ pub enum ScanError {
     #[error("batch must be greater than zero")]
     ZeroBatch,
     #[error(
-        "invalid deliver policy '{value}' (expected all, new, last, by_start_seq, by_start_time)"
+        "invalid start policy '{value}' (expected all, new, last, by_start_seq, by_start_time)"
     )]
-    InvalidDeliver { value: String },
-    #[error("deliver => 'by_start_seq' requires start_seq")]
-    DeliverNeedsStartSeq,
-    #[error("deliver => 'by_start_time' requires start_time")]
-    DeliverNeedsStartTime,
+    InvalidStart { value: String },
+    #[error("start => 'by_start_seq' requires start_seq")]
+    StartNeedsStartSeq,
+    #[error("start => 'by_start_time' requires start_time")]
+    StartNeedsStartTime,
 }
