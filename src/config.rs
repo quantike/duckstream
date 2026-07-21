@@ -1,7 +1,7 @@
-//! Parameter parsing and validation helpers for `read_nats`.
+//! Parameter parsing and validation helpers for `read_jetstream`.
 //!
 //! This module holds the pure, network-free logic that turns user-supplied
-//! parameters into typed configuration: the [`DeliverSpec`] delivery-policy
+//! parameters into typed configuration: the [`StartSpec`] delivery-policy
 //! selector, NATS [`subject_matches`] token matching, and DuckDB timestamp
 //! parsing ([`parse_timestamp_micros`]). Keeping these free of I/O makes them
 //! directly unit-testable without a live NATS server.
@@ -11,14 +11,14 @@ use async_nats::jetstream;
 use crate::error::ScanError;
 
 /// The starting delivery point for a consumer, mirroring JetStream's
-/// `DeliverPolicy`. Selected by the `deliver` parameter and honored only when a
+/// `DeliverPolicy`. Selected by the `start` parameter and honored only when a
 /// consumer is first created (an existing durable consumer resumes from its
 /// stored cursor regardless).
 ///
 /// `ByStartSeq`/`ByStartTime` reuse the `start_seq`/`start_time` parameters,
-/// resolved to the concrete policy in [`DeliverSpec::into_policy`].
+/// resolved to the concrete policy in [`StartSpec::into_policy`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DeliverSpec {
+pub enum StartSpec {
     All,
     New,
     Last,
@@ -26,8 +26,8 @@ pub enum DeliverSpec {
     ByStartTime,
 }
 
-impl DeliverSpec {
-    /// Parse the `deliver` parameter. Unknown values are rejected.
+impl StartSpec {
+    /// Parse the `start` parameter. Unknown values are rejected.
     pub fn parse(value: &str) -> Result<Self, ScanError> {
         match value {
             "all" => Ok(Self::All),
@@ -35,7 +35,7 @@ impl DeliverSpec {
             "last" => Ok(Self::Last),
             "by_start_seq" => Ok(Self::ByStartSeq),
             "by_start_time" => Ok(Self::ByStartTime),
-            other => Err(ScanError::InvalidDeliver {
+            other => Err(ScanError::InvalidStart {
                 value: other.to_string(),
             }),
         }
@@ -59,14 +59,14 @@ impl DeliverSpec {
             Self::New => Ok(DeliverPolicy::New),
             Self::Last => Ok(DeliverPolicy::Last),
             Self::ByStartSeq => {
-                let start_sequence = start_seq.ok_or(ScanError::DeliverNeedsStartSeq)?;
+                let start_sequence = start_seq.ok_or(ScanError::StartNeedsStartSeq)?;
                 Ok(DeliverPolicy::ByStartSequence { start_sequence })
             }
             Self::ByStartTime => {
-                let micros = start_time_micros.ok_or(ScanError::DeliverNeedsStartTime)?;
+                let micros = start_time_micros.ok_or(ScanError::StartNeedsStartTime)?;
                 let nanos = (micros as i128) * 1_000;
                 let start_time = time::OffsetDateTime::from_unix_timestamp_nanos(nanos)
-                    .map_err(|_| ScanError::DeliverNeedsStartTime)?;
+                    .map_err(|_| ScanError::StartNeedsStartTime)?;
                 Ok(DeliverPolicy::ByStartTime { start_time })
             }
         }
@@ -122,7 +122,7 @@ pub fn parse_timestamp_micros(s: &str) -> Result<i64, ScanError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_timestamp_micros, subject_matches, DeliverSpec};
+    use super::{parse_timestamp_micros, subject_matches, StartSpec};
     use async_nats::jetstream::consumer::DeliverPolicy;
 
     #[test]
@@ -186,57 +186,57 @@ mod tests {
     }
 
     #[test]
-    fn deliver_spec_parses_known_values() {
-        assert_eq!(DeliverSpec::parse("all").unwrap(), DeliverSpec::All);
-        assert_eq!(DeliverSpec::parse("new").unwrap(), DeliverSpec::New);
-        assert_eq!(DeliverSpec::parse("last").unwrap(), DeliverSpec::Last);
+    fn start_spec_parses_known_values() {
+        assert_eq!(StartSpec::parse("all").unwrap(), StartSpec::All);
+        assert_eq!(StartSpec::parse("new").unwrap(), StartSpec::New);
+        assert_eq!(StartSpec::parse("last").unwrap(), StartSpec::Last);
         assert_eq!(
-            DeliverSpec::parse("by_start_seq").unwrap(),
-            DeliverSpec::ByStartSeq
+            StartSpec::parse("by_start_seq").unwrap(),
+            StartSpec::ByStartSeq
         );
         assert_eq!(
-            DeliverSpec::parse("by_start_time").unwrap(),
-            DeliverSpec::ByStartTime
+            StartSpec::parse("by_start_time").unwrap(),
+            StartSpec::ByStartTime
         );
     }
 
     #[test]
-    fn deliver_spec_rejects_unknown() {
-        assert!(DeliverSpec::parse("newest").is_err());
-        assert!(DeliverSpec::parse("").is_err());
+    fn start_spec_rejects_unknown() {
+        assert!(StartSpec::parse("newest").is_err());
+        assert!(StartSpec::parse("").is_err());
     }
 
     #[test]
-    fn deliver_spec_simple_policies_ignore_params() {
+    fn start_spec_simple_policies_ignore_params() {
         assert!(matches!(
-            DeliverSpec::All.into_policy(None, None).unwrap(),
+            StartSpec::All.into_policy(None, None).unwrap(),
             DeliverPolicy::All
         ));
         assert!(matches!(
-            DeliverSpec::New.into_policy(Some(5), Some(1)).unwrap(),
+            StartSpec::New.into_policy(Some(5), Some(1)).unwrap(),
             DeliverPolicy::New
         ));
         assert!(matches!(
-            DeliverSpec::Last.into_policy(None, None).unwrap(),
+            StartSpec::Last.into_policy(None, None).unwrap(),
             DeliverPolicy::Last
         ));
     }
 
     #[test]
-    fn deliver_spec_by_start_seq_uses_start_seq() {
-        match DeliverSpec::ByStartSeq.into_policy(Some(42), None).unwrap() {
+    fn start_spec_by_start_seq_uses_start_seq() {
+        match StartSpec::ByStartSeq.into_policy(Some(42), None).unwrap() {
             DeliverPolicy::ByStartSequence { start_sequence } => assert_eq!(start_sequence, 42),
             other => panic!("expected ByStartSequence, got {other:?}"),
         }
         // Missing start_seq is an error.
-        assert!(DeliverSpec::ByStartSeq.into_policy(None, None).is_err());
+        assert!(StartSpec::ByStartSeq.into_policy(None, None).is_err());
     }
 
     #[test]
-    fn deliver_spec_by_start_time_uses_start_time() {
+    fn start_spec_by_start_time_uses_start_time() {
         // 2030-01-01 00:00:00 UTC == 1_893_456_000_000_000 micros.
         let micros = 1_893_456_000_000_000;
-        match DeliverSpec::ByStartTime
+        match StartSpec::ByStartTime
             .into_policy(None, Some(micros))
             .unwrap()
         {
@@ -246,6 +246,6 @@ mod tests {
             other => panic!("expected ByStartTime, got {other:?}"),
         }
         // Missing start_time is an error.
-        assert!(DeliverSpec::ByStartTime.into_policy(None, None).is_err());
+        assert!(StartSpec::ByStartTime.into_policy(None, None).is_err());
     }
 }
