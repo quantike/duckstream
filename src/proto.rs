@@ -145,17 +145,16 @@ pub fn decode_message(descriptor: &MessageDescriptor, payload: &[u8]) -> Option<
     DynamicMessage::decode(descriptor.clone(), payload).ok()
 }
 
-/// Decode a payload and serialize the whole message to JSON, for `format =>
-/// 'json'` on a protobuf stream.
+/// Serialize an already-decoded message to JSON, for `format => 'json'` on a
+/// protobuf stream.
 ///
 /// Field names are verbatim from the `.proto` (snake_case), so `->>` paths and
 /// `proto_extract` column names agree. Value encodings follow canonical
 /// proto-JSON: 64-bit integers as strings, `bytes` as base64, enums by name.
-/// `None` means the payload did not decode.
-pub fn message_to_json(descriptor: &MessageDescriptor, payload: &[u8]) -> Option<String> {
+/// `None` means serialization failed.
+pub fn message_to_json(message: &DynamicMessage) -> Option<String> {
     use prost_reflect::SerializeOptions;
 
-    let message = decode_message(descriptor, payload)?;
     let options = SerializeOptions::new().use_proto_field_name(true);
     let mut buf = Vec::new();
     let mut serializer = serde_json::Serializer::new(&mut buf);
@@ -387,7 +386,8 @@ mod tests {
             msg.encode_to_vec()
         };
 
-        let json = message_to_json(&desc, &bytes).unwrap();
+        let message = decode_message(&desc, &bytes).unwrap();
+        let json = message_to_json(&message).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
 
         assert_eq!(parsed["label"], serde_json::json!("hi"));
@@ -401,6 +401,6 @@ mod tests {
     fn message_to_json_returns_none_on_garbage() {
         let desc = compile_test_schema();
         // A lone run of high continuation bytes is an invalid varint tag.
-        assert!(message_to_json(&desc, &[0xff, 0xff, 0xff, 0xff]).is_none());
+        assert!(decode_message(&desc, &[0xff, 0xff, 0xff, 0xff]).is_none());
     }
 }

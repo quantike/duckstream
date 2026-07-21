@@ -739,8 +739,8 @@ impl VTab for ReadJetstream {
                 seq_vec.as_mut_slice::<u64>()[n] = row.seq;
                 ts_vec.as_mut_slice::<i64>()[n] = row.ts_micros;
             }
-            // Decoded once here to drive the error check and the extracted
-            // columns; the format => 'json' payload path decodes separately.
+            // Decoded once here to drive the error check, the extracted
+            // columns, and the format => 'json' payload path.
             let proto_decoded = if let Some(descriptor) = &proto_descriptor {
                 // Protobuf decode is permissive: JSON text often decodes to junk
                 // rather than failing, so also treat a JSON lead byte as an error.
@@ -764,8 +764,11 @@ impl VTab for ReadJetstream {
                     Err(_) => payload_vec.set_null(n),
                 },
                 (PayloadFormat::Json, true) => {
-                    let descriptor = proto_descriptor.as_ref().unwrap();
-                    match proto::message_to_json(descriptor, &row.payload) {
+                    let json = proto_decoded
+                        .as_ref()
+                        .and_then(|d| d.as_ref())
+                        .and_then(proto::message_to_json);
+                    match json {
                         Some(s) => payload_vec.insert(n, s.as_str()),
                         None => payload_vec.set_null(n),
                     }
