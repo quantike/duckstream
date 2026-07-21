@@ -721,6 +721,7 @@ name = "duckstream"
 version = "0.1.0"
 dependencies = [
  "async-nats",
+ "bytes",
  "duckdb",
  "futures-util",
  "prost",
