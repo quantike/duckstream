@@ -73,6 +73,35 @@ impl StartSpec {
     }
 }
 
+/// The DuckDB type presented for the `payload` column, selected by the `format`
+/// parameter.
+///
+/// This is a whole-payload retype, independent of the `json_extract`/`proto_*`
+/// extraction params (which add their own columns). [`Json`](Self::Json) emits
+/// VARCHAR aliased as `JSON` so the `json` extension operators (`->`, `->>`)
+/// apply without a cast.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PayloadFormat {
+    #[default]
+    Blob,
+    Text,
+    Json,
+}
+
+impl PayloadFormat {
+    /// Parse the `format` parameter. Unknown values are rejected.
+    pub fn parse(value: &str) -> Result<Self, ScanError> {
+        match value {
+            "blob" => Ok(Self::Blob),
+            "text" => Ok(Self::Text),
+            "json" => Ok(Self::Json),
+            other => Err(ScanError::InvalidFormat {
+                value: other.to_string(),
+            }),
+        }
+    }
+}
+
 /// Match a NATS subject against a filter using NATS token semantics.
 ///
 /// Tokens are separated by `.`. The wildcard `*` matches exactly one token;
@@ -122,7 +151,7 @@ pub fn parse_timestamp_micros(s: &str) -> Result<i64, ScanError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_timestamp_micros, subject_matches, StartSpec};
+    use super::{parse_timestamp_micros, subject_matches, PayloadFormat, StartSpec};
     use async_nats::jetstream::consumer::DeliverPolicy;
 
     #[test]
@@ -204,6 +233,24 @@ mod tests {
     fn start_spec_rejects_unknown() {
         assert!(StartSpec::parse("newest").is_err());
         assert!(StartSpec::parse("").is_err());
+    }
+
+    #[test]
+    fn payload_format_parses_known_values() {
+        assert_eq!(PayloadFormat::parse("blob").unwrap(), PayloadFormat::Blob);
+        assert_eq!(PayloadFormat::parse("text").unwrap(), PayloadFormat::Text);
+        assert_eq!(PayloadFormat::parse("json").unwrap(), PayloadFormat::Json);
+    }
+
+    #[test]
+    fn payload_format_rejects_unknown() {
+        assert!(PayloadFormat::parse("bytes").is_err());
+        assert!(PayloadFormat::parse("").is_err());
+    }
+
+    #[test]
+    fn payload_format_defaults_to_blob() {
+        assert_eq!(PayloadFormat::default(), PayloadFormat::Blob);
     }
 
     #[test]

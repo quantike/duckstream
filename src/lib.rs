@@ -43,10 +43,11 @@ mod proto;
 mod row;
 mod stream;
 
-use config::{parse_timestamp_micros, subject_matches, StartSpec};
+use config::{parse_timestamp_micros, subject_matches, PayloadFormat, StartSpec};
 use error::ScanError;
 use output::{
-    json_extract_string, looks_like_json, non_json_hint, non_proto_hint, write_proto_value,
+    json_extract_string, json_payload_text, looks_like_json, non_json_hint, non_proto_hint,
+    write_proto_value,
 };
 use proto::{ProtoField, ProtoValue};
 use row::Row;
@@ -98,6 +99,8 @@ struct ReadJetstreamBindData {
     end_time_micros: Option<i64>,
     /// JSON field paths to extract as extra columns (dot-notation for nesting).
     json_fields: Vec<String>,
+    /// DuckDB type presented for the `payload` column (`blob`/`text`/`json`).
+    format: PayloadFormat,
     /// When true, undecodable payloads leave extracted columns NULL instead of
     /// failing the query.
     ignore_errors: bool,
@@ -149,6 +152,8 @@ struct ScanState {
     subject: Option<String>,
     /// JSON field paths to extract as extra columns.
     json_fields: Vec<String>,
+    /// DuckDB type presented for the `payload` column (`blob`/`text`/`json`).
+    format: PayloadFormat,
     /// When true, undecodable payloads yield NULL columns instead of erroring.
     ignore_errors: bool,
     /// Compiled protobuf descriptor + resolved field paths, if using protobuf.
@@ -225,7 +230,12 @@ impl VTab for ReadJetstream {
             .map(|items| items.iter().map(|v| v.to_string()).collect())
             .unwrap_or_default();
 
-        // Validate the decode-parameter combination up front.
+        let format = bind
+            .get_named_parameter("format")
+            .map(|v| PayloadFormat::parse(&v.to_string()))
+            .transpose()?
+            .unwrap_or_default();
+
         if !json_fields.is_empty() && !proto_paths.is_empty() {
             return Err(Box::new(ScanError::DecodeConflict));
         }
@@ -235,7 +245,10 @@ impl VTab for ReadJetstream {
             if proto_file.is_none() || proto_message.is_none() {
                 return Err(Box::new(ScanError::ProtoIncomplete));
             }
-            if proto_paths.is_empty() {
+            // `proto_extract` is normally required, but `format => 'json'` decodes
+            // the whole message to a JSON payload column without named fields, so
+            // no `proto_extract` is needed in that case.
+            if proto_paths.is_empty() && format != PayloadFormat::Json {
                 return Err(Box::new(ScanError::ProtoNoFields));
             }
         }
@@ -258,13 +271,19 @@ impl VTab for ReadJetstream {
         bind.add_result_column("seq", ubigint());
         bind.add_result_column("ts_nats", timestamp());
 
-        // `payload` is BLOB by default, but becomes VARCHAR when extracting JSON
-        // (the payload is then known-valid UTF-8 text, avoiding BLOB validation).
-        // Protobuf payloads stay BLOB (binary wire format).
-        let payload_type = if json_fields.is_empty() {
-            LogicalTypeHandle::from(LogicalTypeId::Blob)
-        } else {
-            varchar()
+        // With `format` unset, extracting JSON implies a text payload, so the
+        // default BLOB becomes VARCHAR rather than staying BLOB.
+        let payload_type = match format {
+            PayloadFormat::Blob if json_fields.is_empty() => {
+                LogicalTypeHandle::from(LogicalTypeId::Blob)
+            }
+            PayloadFormat::Blob => varchar(),
+            PayloadFormat::Text => varchar(),
+            PayloadFormat::Json => {
+                let mut t = varchar();
+                t.set_alias("JSON");
+                t
+            }
         };
         bind.add_result_column("payload", payload_type);
 
@@ -417,6 +436,7 @@ impl VTab for ReadJetstream {
             start_time_micros,
             end_time_micros,
             json_fields,
+            format,
             ignore_errors,
             proto_descriptor,
             proto_fields,
@@ -445,6 +465,7 @@ impl VTab for ReadJetstream {
                 // client-side filter is applied during the drain.
                 subject: None,
                 json_fields: bind_data.json_fields.clone(),
+                format: bind_data.format,
                 ignore_errors: bind_data.ignore_errors,
                 proto_descriptor: bind_data.proto_descriptor.clone(),
                 proto_fields: bind_data.proto_fields.clone(),
@@ -540,6 +561,7 @@ impl VTab for ReadJetstream {
                     stream_name: bind_data.stream.clone(),
                     subject: bind_data.subject.clone(),
                     json_fields: bind_data.json_fields.clone(),
+                    format: bind_data.format,
                     ignore_errors: bind_data.ignore_errors,
                     proto_descriptor: bind_data.proto_descriptor.clone(),
                     proto_fields: bind_data.proto_fields.clone(),
@@ -689,6 +711,7 @@ impl VTab for ReadJetstream {
         // (e.g. Arc) and borrowed instead of cloned.
         let stream_name = state.stream_name.clone();
         let json_fields = state.json_fields.clone();
+        let format = state.format;
         let ignore_errors = state.ignore_errors;
         let proto_descriptor = state.proto_descriptor.clone();
         let proto_fields = state.proto_fields.clone();
@@ -697,7 +720,7 @@ impl VTab for ReadJetstream {
         let subject_vec = output.flat_vector(1);
         let mut seq_vec = output.flat_vector(2);
         let mut ts_vec = output.flat_vector(3);
-        let payload_vec = output.flat_vector(4);
+        let mut payload_vec = output.flat_vector(4);
 
         // Extra columns follow the five base columns at index 5+. JSON and
         // proto extraction are mutually exclusive, so both loops start at 5.
@@ -717,7 +740,21 @@ impl VTab for ReadJetstream {
                 seq_vec.as_mut_slice::<u64>()[n] = row.seq;
                 ts_vec.as_mut_slice::<i64>()[n] = row.ts_micros;
             }
-            payload_vec.insert(n, row.payload.as_ref());
+            // The `payload` column type was fixed at bind time by `format`.
+            // BLOB takes raw bytes; text/json take UTF-8. For json, emit lazily:
+            // the bytes are written as-is and DuckDB validates at query time,
+            // except that `ignore_errors` skips clearly-non-JSON payloads (NULL).
+            match format {
+                PayloadFormat::Blob => payload_vec.insert(n, row.payload.as_ref()),
+                PayloadFormat::Text => match std::str::from_utf8(&row.payload) {
+                    Ok(s) => payload_vec.insert(n, s),
+                    Err(_) => payload_vec.set_null(n),
+                },
+                PayloadFormat::Json => match json_payload_text(&row.payload, ignore_errors) {
+                    Some(s) => payload_vec.insert(n, s),
+                    None => payload_vec.set_null(n),
+                },
+            };
 
             if !json_fields.is_empty() {
                 let doc: Option<serde_json::Value> = serde_json::from_slice(&row.payload).ok();
@@ -786,6 +823,7 @@ impl VTab for ReadJetstream {
             ("batch".to_string(), ubigint()),
             ("max_messages".to_string(), ubigint()),
             ("json_extract".to_string(), varchar_list()),
+            ("format".to_string(), varchar()),
             ("ignore_errors".to_string(), boolean()),
             ("proto_file".to_string(), varchar()),
             ("proto_message".to_string(), varchar()),
