@@ -697,6 +697,10 @@ impl VTab for ReadJetstream {
                     *remaining = remaining.saturating_sub(fetched.len() as u64);
                     rows = fetched;
                 }
+                // `fetch`'s no_wait returns only what is available now, so an
+                // empty batch ends the drain even if `remaining > 0`: the seed
+                // came from a point-in-time `num_pending` estimate, and a
+                // bounded drain does not wait for messages that arrive later.
                 if *remaining == 0 || rows.is_empty() {
                     state.done = true;
                 }
@@ -761,7 +765,15 @@ impl VTab for ReadJetstream {
                 (PayloadFormat::Blob, _) => payload_vec.insert(n, row.payload.as_ref()),
                 (PayloadFormat::Text, _) => match std::str::from_utf8(&row.payload) {
                     Ok(s) => payload_vec.insert(n, s),
-                    Err(_) => payload_vec.set_null(n),
+                    // Mirror the other decode paths: fail loudly unless the
+                    // caller opted into dropping undecodable payloads.
+                    Err(_) if ignore_errors => payload_vec.set_null(n),
+                    Err(_) => {
+                        return Err(Box::new(ScanError::NonUtf8Payload {
+                            stream: stream_name.clone(),
+                            seq: row.seq,
+                        }))
+                    }
                 },
                 (PayloadFormat::Json, true) => {
                     let json = proto_decoded

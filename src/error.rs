@@ -79,4 +79,9 @@ pub enum ScanError {
     StartNeedsStartTime,
     #[error("invalid format '{value}' (expected blob, text, or json)")]
     InvalidFormat { value: String },
+    #[error(
+        "payload on stream '{stream}' at seq {seq} is not valid UTF-8 (format => 'text'). \
+         Set ignore_errors => true to skip undecodable payloads, or use format => 'blob'."
+    )]
+    NonUtf8Payload { stream: String, seq: u64 },
 }
