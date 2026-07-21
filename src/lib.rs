@@ -245,9 +245,8 @@ impl VTab for ReadJetstream {
             if proto_file.is_none() || proto_message.is_none() {
                 return Err(Box::new(ScanError::ProtoIncomplete));
             }
-            // `proto_extract` is normally required, but `format => 'json'` decodes
-            // the whole message to a JSON payload column without named fields, so
-            // no `proto_extract` is needed in that case.
+            // format => 'json' serializes the whole message, so it needs no named
+            // fields; proto_extract is otherwise required.
             if proto_paths.is_empty() && format != PayloadFormat::Json {
                 return Err(Box::new(ScanError::ProtoNoFields));
             }
@@ -740,20 +739,43 @@ impl VTab for ReadJetstream {
                 seq_vec.as_mut_slice::<u64>()[n] = row.seq;
                 ts_vec.as_mut_slice::<i64>()[n] = row.ts_micros;
             }
-            // The `payload` column type was fixed at bind time by `format`.
-            // BLOB takes raw bytes; text/json take UTF-8. For json, emit lazily:
-            // the bytes are written as-is and DuckDB validates at query time,
-            // except that `ignore_errors` skips clearly-non-JSON payloads (NULL).
-            match format {
-                PayloadFormat::Blob => payload_vec.insert(n, row.payload.as_ref()),
-                PayloadFormat::Text => match std::str::from_utf8(&row.payload) {
+            // Decoded once here to drive the error check and the extracted
+            // columns; the format => 'json' payload path decodes separately.
+            let proto_decoded = if let Some(descriptor) = &proto_descriptor {
+                // Protobuf decode is permissive: JSON text often decodes to junk
+                // rather than failing, so also treat a JSON lead byte as an error.
+                let decoded = proto::decode_message(descriptor, &row.payload);
+                if !ignore_errors && (decoded.is_none() || looks_like_json(&row.payload)) {
+                    return Err(Box::new(ScanError::NonProtoPayload {
+                        stream: stream_name.clone(),
+                        seq: row.seq,
+                        hint: non_proto_hint(&row.payload),
+                    }));
+                }
+                Some(decoded)
+            } else {
+                None
+            };
+
+            match (format, proto_descriptor.is_some()) {
+                (PayloadFormat::Blob, _) => payload_vec.insert(n, row.payload.as_ref()),
+                (PayloadFormat::Text, _) => match std::str::from_utf8(&row.payload) {
                     Ok(s) => payload_vec.insert(n, s),
                     Err(_) => payload_vec.set_null(n),
                 },
-                PayloadFormat::Json => match json_payload_text(&row.payload, ignore_errors) {
-                    Some(s) => payload_vec.insert(n, s),
-                    None => payload_vec.set_null(n),
-                },
+                (PayloadFormat::Json, true) => {
+                    let descriptor = proto_descriptor.as_ref().unwrap();
+                    match proto::message_to_json(descriptor, &row.payload) {
+                        Some(s) => payload_vec.insert(n, s.as_str()),
+                        None => payload_vec.set_null(n),
+                    }
+                }
+                (PayloadFormat::Json, false) => {
+                    match json_payload_text(&row.payload, ignore_errors) {
+                        Some(s) => payload_vec.insert(n, s),
+                        None => payload_vec.set_null(n),
+                    }
+                }
             };
 
             if !json_fields.is_empty() {
@@ -773,17 +795,7 @@ impl VTab for ReadJetstream {
                 }
             }
 
-            if let Some(descriptor) = &proto_descriptor {
-                // Protobuf decode is permissive: JSON text often decodes to junk
-                // rather than failing, so also treat a JSON lead byte as an error.
-                let decoded = proto::decode_message(descriptor, &row.payload);
-                if !ignore_errors && (decoded.is_none() || looks_like_json(&row.payload)) {
-                    return Err(Box::new(ScanError::NonProtoPayload {
-                        stream: stream_name.clone(),
-                        seq: row.seq,
-                        hint: non_proto_hint(&row.payload),
-                    }));
-                }
+            if let Some(decoded) = &proto_decoded {
                 for (i, field) in proto_fields.iter().enumerate() {
                     let value = decoded
                         .as_ref()
