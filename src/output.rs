@@ -34,6 +34,38 @@ pub fn write_proto_value(vec: &mut FlatVector, row: usize, value: ProtoValue) {
     }
 }
 
+/// The payload was not valid UTF-8 and `ignore_errors` was not set, so
+/// [`write_utf8_payload`] left the slot untouched. The caller attaches
+/// stream/seq context and raises its own typed error.
+#[derive(Debug)]
+pub struct NonUtf8Payload;
+
+/// Write a raw payload into a VARCHAR flat vector as UTF-8 text, shared by the
+/// `format => 'text'` and non-proto `format => 'json'` paths.
+///
+/// Writes the text, or SQL NULL when `ignore_errors` drops an undecodable
+/// payload. Returns [`NonUtf8Payload`] on non-UTF-8 without `ignore_errors`,
+/// leaving the slot untouched so the caller can raise a typed error with
+/// stream/seq context via `?`.
+pub fn write_utf8_payload(
+    vec: &mut FlatVector,
+    row: usize,
+    payload: &[u8],
+    ignore_errors: bool,
+) -> Result<(), NonUtf8Payload> {
+    match std::str::from_utf8(payload) {
+        Ok(s) => {
+            vec.insert(row, s);
+            Ok(())
+        }
+        Err(_) if ignore_errors => {
+            vec.set_null(row);
+            Ok(())
+        }
+        Err(_) => Err(NonUtf8Payload),
+    }
+}
+
 /// Extract a value from a JSON document by dot-separated path and render it as
 /// a string suitable for a VARCHAR column.
 ///
@@ -75,37 +107,18 @@ pub fn non_json_hint(payload: &[u8]) -> String {
 
 /// Hint appended to a protobuf decode error, suggesting the JSON decoder when
 /// the payload looks like JSON. Returns a leading `": ..."` fragment or empty.
+///
+/// A lead-byte sniff suffices for a hint, unlike the decode guard
+/// [`crate::proto::is_message_instance`].
 pub fn non_proto_hint(payload: &[u8]) -> String {
-    if looks_like_json(payload) {
+    let opens_json = matches!(lead_byte(payload), Some(b'{') | Some(b'['));
+    if opens_json {
         ": the payload looks like JSON; use json_extract instead of proto_file, \
          proto_message, and proto_extract"
             .to_string()
     } else {
         String::new()
     }
-}
-
-/// Text for a lazily-emitted `format => 'json'` payload, or `None` to write SQL
-/// NULL.
-///
-/// The bytes are emitted unparsed (DuckDB validates at query time). With
-/// `ignore_errors`, a payload whose lead byte does not open a JSON object/array
-/// is dropped to NULL so a mixed stream does not fail a scan. This is a lead-byte
-/// sniff, not a parse: subtly-malformed JSON still reaches DuckDB.
-pub fn json_payload_text(payload: &[u8], ignore_errors: bool) -> Option<&str> {
-    if ignore_errors && !looks_like_json(payload) {
-        return None;
-    }
-    std::str::from_utf8(payload).ok()
-}
-
-/// Whether the payload's first non-whitespace byte opens a JSON object or array.
-///
-/// Protobuf decoding is permissive and often succeeds on JSON bytes, so this
-/// positive check flags a JSON stream that a decode would otherwise accept. It
-/// misses top-level JSON scalars, which are rare in practice.
-pub fn looks_like_json(payload: &[u8]) -> bool {
-    matches!(lead_byte(payload), Some(b'{') | Some(b'['))
 }
 
 /// First non-ASCII-whitespace byte of `payload`, if any.
@@ -115,9 +128,7 @@ fn lead_byte(payload: &[u8]) -> Option<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        json_extract_string, json_payload_text, looks_like_json, non_json_hint, non_proto_hint,
-    };
+    use super::{json_extract_string, non_json_hint, non_proto_hint};
 
     #[test]
     fn json_scalar_extraction() {
@@ -179,33 +190,5 @@ mod tests {
     #[test]
     fn proto_hint_is_empty_for_binary() {
         assert_eq!(non_proto_hint(b"\x0A\x26abc"), "");
-    }
-
-    #[test]
-    fn json_sniff_matches_object_and_array_only() {
-        assert!(looks_like_json(b"{\"a\":1}"));
-        assert!(looks_like_json(b"\n\t [1]"));
-        assert!(!looks_like_json(b"\x0A\x26abc"));
-        // A bare JSON string/number at top level is intentionally not sniffed.
-        assert!(!looks_like_json(b"\"hello\""));
-        assert!(!looks_like_json(b""));
-    }
-
-    #[test]
-    fn json_payload_text_passes_through_without_ignore() {
-        assert_eq!(json_payload_text(b"{\"a\":1}", false), Some("{\"a\":1}"));
-        assert_eq!(json_payload_text(b"not json", false), Some("not json"));
-    }
-
-    #[test]
-    fn json_payload_text_skips_non_json_under_ignore() {
-        assert_eq!(json_payload_text(b"\x0A\x26abc", true), None);
-        assert_eq!(json_payload_text(b"not json", true), None);
-        assert_eq!(json_payload_text(b"  [1,2]", true), Some("  [1,2]"));
-    }
-
-    #[test]
-    fn json_payload_text_rejects_invalid_utf8() {
-        assert_eq!(json_payload_text(&[0xff, 0xfe], false), None);
     }
 }

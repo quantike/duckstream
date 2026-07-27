@@ -46,8 +46,7 @@ mod stream;
 use config::{parse_timestamp_micros, subject_matches, PayloadFormat, StartSpec};
 use error::ScanError;
 use output::{
-    json_extract_string, json_payload_text, looks_like_json, non_json_hint, non_proto_hint,
-    write_proto_value,
+    json_extract_string, non_json_hint, non_proto_hint, write_proto_value, write_utf8_payload,
 };
 use proto::{ProtoField, ProtoValue};
 use row::Row;
@@ -746,10 +745,13 @@ impl VTab for ReadJetstream {
             // Decoded once here to drive the error check, the extracted
             // columns, and the format => 'json' payload path.
             let proto_decoded = if let Some(descriptor) = &proto_descriptor {
-                // Protobuf decode is permissive: JSON text often decodes to junk
-                // rather than failing, so also treat a JSON lead byte as an error.
+                // Same predicate drives both reactions: throw by default, skip
+                // under ignore_errors.
                 let decoded = proto::decode_message(descriptor, &row.payload);
-                if !ignore_errors && (decoded.is_none() || looks_like_json(&row.payload)) {
+                let is_instance = decoded
+                    .as_ref()
+                    .is_some_and(|d| proto::is_message_instance(d, &row.payload));
+                if !ignore_errors && !is_instance {
                     return Err(Box::new(ScanError::NonProtoPayload {
                         stream: stream_name.clone(),
                         seq: row.seq,
@@ -763,18 +765,16 @@ impl VTab for ReadJetstream {
 
             match (format, proto_descriptor.is_some()) {
                 (PayloadFormat::Blob, _) => payload_vec.insert(n, row.payload.as_ref()),
-                (PayloadFormat::Text, _) => match std::str::from_utf8(&row.payload) {
-                    Ok(s) => payload_vec.insert(n, s),
-                    // Mirror the other decode paths: fail loudly unless the
-                    // caller opted into dropping undecodable payloads.
-                    Err(_) if ignore_errors => payload_vec.set_null(n),
-                    Err(_) => {
-                        return Err(Box::new(ScanError::NonUtf8Payload {
+                (PayloadFormat::Text, _) => {
+                    // Fail loudly on non-UTF-8 unless the caller opted into
+                    // dropping undecodable payloads.
+                    write_utf8_payload(&mut payload_vec, n, &row.payload, ignore_errors).map_err(
+                        |_| ScanError::NonUtf8Payload {
                             stream: stream_name.clone(),
                             seq: row.seq,
-                        }))
-                    }
-                },
+                        },
+                    )?;
+                }
                 (PayloadFormat::Json, true) => {
                     let json = proto_decoded
                         .as_ref()
@@ -786,10 +786,14 @@ impl VTab for ReadJetstream {
                     }
                 }
                 (PayloadFormat::Json, false) => {
-                    match json_payload_text(&row.payload, ignore_errors) {
-                        Some(s) => payload_vec.insert(n, s),
-                        None => payload_vec.set_null(n),
-                    }
+                    // Emitted unparsed; DuckDB validates JSON at query time. Only
+                    // non-UTF-8 is rejected here, mirroring format => 'text'.
+                    write_utf8_payload(&mut payload_vec, n, &row.payload, ignore_errors).map_err(
+                        |_| ScanError::NonUtf8Payload {
+                            stream: stream_name.clone(),
+                            seq: row.seq,
+                        },
+                    )?;
                 }
             };
 

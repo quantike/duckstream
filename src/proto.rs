@@ -145,6 +145,18 @@ pub fn decode_message(descriptor: &MessageDescriptor, payload: &[u8]) -> Option<
     DynamicMessage::decode(descriptor.clone(), payload).ok()
 }
 
+/// Whether decoded bytes are really an instance of the declared type.
+///
+/// Foreign bytes that still parse as valid wire format land in unknown fields.
+/// Accept an empty payload (all-default message), any present declared field,
+/// or a decode that left no unknown field. The last case admits a proto3
+/// message carrying only explicit default-valued scalars, which set no field.
+pub fn is_message_instance(message: &DynamicMessage, payload: &[u8]) -> bool {
+    payload.is_empty()
+        || message.fields().next().is_some()
+        || message.unknown_fields().next().is_none()
+}
+
 /// Serialize an already-decoded message to JSON, for `format => 'json'` on a
 /// protobuf stream.
 ///
@@ -402,5 +414,76 @@ mod tests {
         let desc = compile_test_schema();
         // A lone run of high continuation bytes is an invalid varint tag.
         assert!(decode_message(&desc, &[0xff, 0xff, 0xff, 0xff]).is_none());
+    }
+
+    #[test]
+    fn real_message_is_an_instance() {
+        let desc = compile_test_schema();
+        let mut msg = DynamicMessage::new(desc.clone());
+        msg.set_field_by_name("id", Value::U64(99));
+        let bytes = {
+            use prost::Message as _;
+            msg.encode_to_vec()
+        };
+        let decoded = decode_message(&desc, &bytes).unwrap();
+        assert!(is_message_instance(&decoded, &bytes));
+    }
+
+    #[test]
+    fn empty_payload_is_the_empty_instance() {
+        // An all-default message encodes to zero bytes; the empty payload is a
+        // valid instance, not foreign data.
+        let desc = compile_test_schema();
+        let decoded = decode_message(&desc, &[]).unwrap();
+        assert!(is_message_instance(&decoded, &[]));
+    }
+
+    #[test]
+    fn explicit_default_scalar_is_an_instance() {
+        // A proto3 default-valued scalar written on the wire (tag 0x08, value 0)
+        // sets no field yet leaves no unknown field: still a real instance.
+        let desc = compile_test_schema();
+        let payload = [0x08u8, 0x00];
+        let decoded = decode_message(&desc, &payload).unwrap();
+        assert!(decoded.fields().next().is_none());
+        assert!(is_message_instance(&decoded, &payload));
+    }
+
+    /// The guard as `func` applies it: decode, then require a real instance.
+    fn reads_as_instance(desc: &MessageDescriptor, payload: &[u8]) -> bool {
+        decode_message(desc, payload).is_some_and(|d| is_message_instance(&d, payload))
+    }
+
+    #[test]
+    fn json_object_is_not_an_instance() {
+        // Foreign to the wire format: the decoder either errors or fills only
+        // unknown fields. Either way, rejected.
+        let desc = compile_test_schema();
+        assert!(!reads_as_instance(&desc, br#"{"id":"99"}"#));
+        assert!(!reads_as_instance(&desc, br#"  [1, 2, 3]"#));
+    }
+
+    #[test]
+    fn json_scalar_is_not_an_instance() {
+        // False negative under the old sniff: a scalar has no `{`/`[` lead byte.
+        let desc = compile_test_schema();
+        assert!(!reads_as_instance(&desc, b"42"));
+        assert!(!reads_as_instance(&desc, b"\"foo\""));
+    }
+
+    #[test]
+    fn group_lead_byte_with_declared_field_is_an_instance() {
+        // False positive under the old sniff: `{` (0x7B) is a valid start-group
+        // tag, yet the message also sets a declared field.
+        let desc = compile_test_schema();
+        let start_group_15 = 0x7Bu8; // (15 << 3) | 3
+        let end_group_15 = 0x7Cu8; // (15 << 3) | 4
+        let id_field = [0x08u8, 0x01]; // (1 << 3) | 0, varint 1
+        let mut payload = vec![start_group_15, end_group_15];
+        payload.extend_from_slice(&id_field);
+        assert_eq!(payload[0], b'{');
+
+        let decoded = decode_message(&desc, &payload).unwrap();
+        assert!(is_message_instance(&decoded, &payload));
     }
 }
