@@ -154,12 +154,54 @@ duckdb -unsigned -cmd "LOAD '$PWD/build/debug/duckstream.duckdb_extension'"
 ## Testing
 
 ```sh
-cargo test        # Rust unit tests
-make test_debug   # SQL tests via DuckDB's SQLLogicTest runner
+cargo test --lib   # Rust unit tests (network-free)
+make test_debug    # SQL smoke test via DuckDB's SQLLogicTest runner
 ```
 
-The SQL tests verify that the extension loads and registers its functions. Behavioral tests against
-a live NATS server are run locally, since CI has no broker.
+The unit tests and the SQL smoke test need no broker; the smoke test only verifies
+that the extension loads and registers its functions.
+
+### Integration tests
+
+`tests/integration.rs` runs the built `.duckdb_extension` against a live NATS
+JetStream broker and asserts on real SQL output. Each case seeds a stream with
+`async-nats`, runs a committed `.sql` file (under `tests/cases/`) through the
+`duckdb` CLI (csv output) with the extension loaded, and snapshots the result
+with [`insta`](https://insta.rs). The extension is driven as a subprocess because
+this crate builds `duckdb` with the `loadable-extension` feature, which cannot
+also be used as an in-process client. Cases share one broker but each uses a
+unique stream name and subject prefix, so they run in parallel without colliding.
+
+```sh
+make debug                    # build the extension the tests load
+cargo test --test integration
+```
+
+Requirements:
+
+- A built extension at `build/debug/duckstream.duckdb_extension`, or `DUCKSTREAM_EXT`
+  pointing at one. If missing, the tests skip rather than fail.
+- A `duckdb` binary on `PATH` (or `DUCKDB_BIN`), matching the build version (v1.5.4).
+- A broker: either Docker (a `nats:2.10.14 --jetstream` container is started
+  automatically), or set `NATS_URL` to reuse a local `nats-server -js`:
+
+  ```sh
+  nats-server -js &
+  NATS_URL=nats://localhost:4222 cargo test --test integration
+  ```
+
+Snapshots live in `tests/snapshots/` and are reviewed with `cargo insta review`.
+The `.sql` files stay runnable by hand; they use `${NATS_URL}`, `${STREAM}`, and
+`${SUBJECT_PREFIX}` placeholders the harness substitutes. CI runs this suite in
+`integration.yml`.
+
+Note: against the Docker broker the scan-mode cases take ~30s each because the
+extension's scan path holds its NATS connection open at query end (the `duckdb`
+process only exits once that connection tears down). Against a local `NATS_URL`
+broker the same suite finishes in well under a second, so it is the fastest way
+to run the tests locally.
+
+
 
 ## License
 

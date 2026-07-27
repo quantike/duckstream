@@ -1,0 +1,6 @@
+---
+source: tests/harness.rs
+expression: output
+---
+n
+3

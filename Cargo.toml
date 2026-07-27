@@ -21,3 +21,8 @@ serde_json = "1.0.150"
 thiserror = "2.0.18"
 time = { version = "0.3.53", features = ["parsing", "macros"] }
 tokio = { version = "1.53.0", features = ["rt-multi-thread", "sync", "time"] }
+
+[dev-dependencies]
+insta = "1.48.0"
+testcontainers = { version = "0.27.3", features = ["blocking"] }
+testcontainers-modules = { version = "0.15.0", features = ["nats"] }

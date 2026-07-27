@@ -1,0 +1,7 @@
+---
+source: tests/harness.rs
+expression: output
+---
+id,total
+1,10.5
+2,20.0
