@@ -46,6 +46,7 @@ jobs:
       - name: Install DuckDB CLI ${{ env.DUCKDB_VERSION }}
         run: |
           set -euo pipefail
+          mkdir -p "$HOME/.local/bin"
           curl -fsSL -o duckdb.zip \
             "https://github.com/duckdb/duckdb/releases/download/${DUCKDB_VERSION}/duckdb_cli-linux-amd64.zip"
           unzip -o duckdb.zip -d "$HOME/.local/bin"
