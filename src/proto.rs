@@ -288,9 +288,18 @@ mod tests {
     "#;
 
     /// Write the schema to a temp file and compile it, returning the descriptor.
+    ///
+    /// Each call gets its own directory. Tests run in parallel within one
+    /// process, so a PID-only path would race: `File::create` truncates the
+    /// shared file while another test reads it mid-write, compiling an empty
+    /// unit whose `t.Msg` is then not found.
     fn compile_test_schema() -> MessageDescriptor {
-        let dir =
-            std::env::temp_dir().join(format!("duckstream_proto_test_{}", std::process::id()));
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let unique = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "duckstream_proto_test_{}_{unique}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("t.proto");
         let mut f = std::fs::File::create(&path).unwrap();
