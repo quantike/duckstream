@@ -1,0 +1,7 @@
+---
+source: tests/harness.rs
+expression: output
+---
+seq,subject,payload
+1,it_durable_resume.orders.us.1,"{\x22id\x22:1,\x22total\x22:10.5}"
+2,it_durable_resume.orders.us.2,"{\x22id\x22:2,\x22total\x22:20.0}"

@@ -1,0 +1,64 @@
+#
+# Integration tests: build the real loadable extension and run it against a
+# live NATS JetStream broker via SQL. Slow (extension build + Docker), so it is
+# separate from the fast fmt/clippy/unit gate in rust.yml.
+#
+# The broker is provided by testcontainers (Docker is available on
+# ubuntu-latest). The duckdb CLI version must match the extension's build
+# target (v1.5.4), since a loadable extension pins to one DuckDB version.
+#
+name: Integration
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: integration-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  DUCKDB_VERSION: v1.5.4
+
+jobs:
+  integration:
+    name: build extension + SQL tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Python (for extension footer tooling)
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install DuckDB CLI ${{ env.DUCKDB_VERSION }}
+        run: |
+          set -euo pipefail
+          curl -fsSL -o duckdb.zip \
+            "https://github.com/duckdb/duckdb/releases/download/${DUCKDB_VERSION}/duckdb_cli-linux-amd64.zip"
+          unzip -o duckdb.zip -d "$HOME/.local/bin"
+          chmod +x "$HOME/.local/bin/duckdb"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Verify DuckDB version
+        run: duckdb --version
+
+      - name: Build loadable extension
+        run: |
+          make configure
+          make debug
+
+      - name: Run integration tests
+        run: cargo test --test integration

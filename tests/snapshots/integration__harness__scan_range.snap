@@ -1,0 +1,8 @@
+---
+source: tests/harness.rs
+expression: output
+---
+seq,subject,payload
+1,it_scan_range.orders.us.1,"{\x22id\x22:1,\x22total\x22:10.5}"
+2,it_scan_range.orders.us.2,"{\x22id\x22:2,\x22total\x22:20.0}"
+3,it_scan_range.orders.eu.3,"{\x22id\x22:3,\x22total\x22:30.0}"
