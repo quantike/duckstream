@@ -61,6 +61,10 @@ const DEFAULT_URL: &str = "nats://localhost:4222";
 /// `batch` parameter is not provided. Applies to ephemeral and durable modes.
 const DEFAULT_BATCH: u64 = 256;
 
+/// Ceiling on scan teardown (see [`ReadJetstreamInitData`]'s [`Drop`]). Matches
+/// `async-nats`'s default `connection_timeout` of 5s.
+const SCAN_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Apply the optional `max_messages` hard cap to a consumer's pending count.
 ///
 /// Returns the number of messages the drain should emit: `pending` when no cap
@@ -135,8 +139,35 @@ struct ConsumerSetup {
 /// Execution state, shared across DuckDB worker threads via the init data's
 /// mutex.
 struct ReadJetstreamInitData {
-    runtime: Runtime,
+    /// `Option` so [`Drop`] can `take` it for [`Runtime::shutdown_timeout`];
+    /// always `Some` outside teardown.
+    runtime: Option<Runtime>,
     inner: Mutex<ScanState>,
+}
+
+/// Drain the scan connection, then bound the runtime shutdown.
+///
+/// Dropping the [`Runtime`] otherwise blocks the DuckDB thread until
+/// `async-nats`'s background connection task stops on a broker-side idle
+/// timeout, delaying process exit (issue #10). The drain closes the connection
+/// so that task exits at once. [`Client::drain`] only enqueues the command and
+/// returns, so the ceiling comes from [`Runtime::shutdown_timeout`], not the
+/// drain: an unresponsive broker cannot delay exit past [`SCAN_DRAIN_TIMEOUT`].
+///
+/// Only the scan path holds a client; consumers have nothing to drain.
+impl Drop for ReadJetstreamInitData {
+    fn drop(&mut self) {
+        let Some(runtime) = self.runtime.take() else {
+            return;
+        };
+        if let Ok(state) = self.inner.get_mut() {
+            if let Source::Scan { client, .. } = &state.source {
+                let client = client.clone();
+                let _ = runtime.block_on(client.drain());
+            }
+        }
+        runtime.shutdown_timeout(SCAN_DRAIN_TIMEOUT);
+    }
 }
 
 /// Mutable read progress, guarded by the init data's mutex.
@@ -170,7 +201,12 @@ struct ScanState {
 enum Source {
     /// Stateless Direct Get scan over a bounded sequence range.
     Scan {
-        stream: jetstream::stream::Stream,
+        /// Retained so teardown can drain it; see [`ReadJetstreamInitData`]'s
+        /// [`Drop`].
+        client: async_nats::Client,
+        /// Boxed: `Stream` is large, and an unboxed variant trips
+        /// `clippy::large_enum_variant`.
+        stream: Box<jetstream::stream::Stream>,
         /// Next sequence to fetch (inclusive).
         current_seq: u64,
         /// Last sequence to fetch (inclusive).
@@ -179,7 +215,8 @@ enum Source {
     /// Bounded drain of a pull consumer (ephemeral or durable), up to the
     /// messages that existed when the consumer was created.
     Consumer {
-        consumer: jetstream::consumer::PullConsumer,
+        /// Boxed for the same reason as [`Source::Scan`]'s `stream`.
+        consumer: Box<jetstream::consumer::PullConsumer>,
         /// Messages left to drain. Seeded from the consumer's `num_pending` at
         /// creation, capped by `max_messages` when set. Reaching zero ends the
         /// read.
@@ -487,7 +524,7 @@ impl VTab for ReadJetstream {
                 proto_fields: bind_data.proto_fields.clone(),
                 done: setup.pending == 0,
                 source: Source::Consumer {
-                    consumer: setup.consumer,
+                    consumer: Box::new(setup.consumer),
                     remaining: setup.pending,
                     batch: setup.batch,
                     ack: setup.ack,
@@ -495,7 +532,7 @@ impl VTab for ReadJetstream {
             };
 
             return Ok(ReadJetstreamInitData {
-                runtime: setup.runtime,
+                runtime: Some(setup.runtime),
                 inner: Mutex::new(state),
             });
         }
@@ -516,7 +553,9 @@ impl VTab for ReadJetstream {
                         url: bind_data.url.clone(),
                         source,
                     })?;
-                let context = jetstream::new(client);
+                // Retain the client so teardown can drain it; `Context` clones
+                // it internally, so this keeps a handle without a second connect.
+                let context = jetstream::new(client.clone());
 
                 let stream = context.get_stream(&bind_data.stream).await.map_err(|e| {
                     ScanError::StreamInfo {
@@ -583,7 +622,8 @@ impl VTab for ReadJetstream {
                     proto_fields: bind_data.proto_fields.clone(),
                     done: last_sequence == 0 || end_seq == 0 || current_seq > end_seq,
                     source: Source::Scan {
-                        stream,
+                        client,
+                        stream: Box::new(stream),
                         current_seq,
                         end_seq,
                     },
@@ -591,7 +631,7 @@ impl VTab for ReadJetstream {
             })?;
 
         Ok(ReadJetstreamInitData {
-            runtime,
+            runtime: Some(runtime),
             inner: Mutex::new(state),
         })
     }
@@ -619,6 +659,7 @@ impl VTab for ReadJetstream {
 
         match &mut state.source {
             Source::Scan {
+                client: _,
                 stream,
                 current_seq,
                 end_seq,
@@ -636,12 +677,16 @@ impl VTab for ReadJetstream {
                     // (multi-message request) or a pull-consumer drain would cut
                     // the round-trips dramatically; the consumer path below
                     // already fetches in batches for this reason.
-                    let fetched = init.runtime.block_on(async {
-                        match stream.direct_get(seq).await {
-                            Ok(msg) => Some(msg),
-                            Err(_) => stream.get_raw_message(seq).await.ok(),
-                        }
-                    });
+                    let fetched = init
+                        .runtime
+                        .as_ref()
+                        .expect("runtime present outside drop")
+                        .block_on(async {
+                            match stream.direct_get(seq).await {
+                                Ok(msg) => Some(msg),
+                                Err(_) => stream.get_raw_message(seq).await.ok(),
+                            }
+                        });
                     let Some(msg) = fetched else {
                         continue;
                     };
@@ -679,37 +724,43 @@ impl VTab for ReadJetstream {
                     // Fine for bounded drains, but each request has round-trip
                     // latency; for very large streams a persistent pull
                     // subscription reused across func calls would amortize that.
-                    let fetched: Vec<Row> = init.runtime.block_on(async {
-                        let mut out = Vec::with_capacity(want);
-                        // `fetch` uses no_wait: returns what is available now and
-                        // ends, so this drains without blocking indefinitely.
-                        if let Ok(mut msgs) = consumer.fetch().max_messages(want).messages().await {
-                            while let Some(Ok(msg)) = msgs.next().await {
-                                let (seq, ts_micros) = match msg.info() {
-                                    Ok(info) => (
-                                        info.stream_sequence,
-                                        (info.published.unix_timestamp_nanos() / 1_000) as i64,
-                                    ),
-                                    Err(_) => (0, 0),
-                                };
-                                // At-least-once: acking before the row reaches
-                                // DuckDB means a query cancelled after this point
-                                // still counts the message as consumed. A crash
-                                // between fetch and ack (or an ignored ack error)
-                                // just redelivers on the next run.
-                                if ack {
-                                    let _ = msg.ack().await;
+                    let fetched: Vec<Row> = init
+                        .runtime
+                        .as_ref()
+                        .expect("runtime present outside drop")
+                        .block_on(async {
+                            let mut out = Vec::with_capacity(want);
+                            // `fetch` uses no_wait: returns what is available now and
+                            // ends, so this drains without blocking indefinitely.
+                            if let Ok(mut msgs) =
+                                consumer.fetch().max_messages(want).messages().await
+                            {
+                                while let Some(Ok(msg)) = msgs.next().await {
+                                    let (seq, ts_micros) = match msg.info() {
+                                        Ok(info) => (
+                                            info.stream_sequence,
+                                            (info.published.unix_timestamp_nanos() / 1_000) as i64,
+                                        ),
+                                        Err(_) => (0, 0),
+                                    };
+                                    // At-least-once: acking before the row reaches
+                                    // DuckDB means a query cancelled after this point
+                                    // still counts the message as consumed. A crash
+                                    // between fetch and ack (or an ignored ack error)
+                                    // just redelivers on the next run.
+                                    if ack {
+                                        let _ = msg.ack().await;
+                                    }
+                                    out.push(Row::new(
+                                        msg.message.subject.clone(),
+                                        seq,
+                                        ts_micros,
+                                        msg.message.payload.clone(),
+                                    ));
                                 }
-                                out.push(Row::new(
-                                    msg.message.subject.clone(),
-                                    seq,
-                                    ts_micros,
-                                    msg.message.payload.clone(),
-                                ));
                             }
-                        }
-                        out
-                    });
+                            out
+                        });
 
                     *remaining = remaining.saturating_sub(fetched.len() as u64);
                     rows = fetched;
