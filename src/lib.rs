@@ -241,8 +241,26 @@ impl VTab for ReadJetstream {
         let using_proto =
             !proto_paths.is_empty() || proto_file.is_some() || proto_message.is_some();
         if using_proto {
-            if proto_file.is_none() || proto_message.is_none() {
-                return Err(Box::new(ScanError::ProtoIncomplete));
+            match (proto_file.is_some(), proto_message.is_some()) {
+                (false, true) => {
+                    return Err(Box::new(ScanError::ProtoIncomplete {
+                        present: "proto_message",
+                        missing: "proto_file",
+                    }));
+                }
+                (true, false) => {
+                    return Err(Box::new(ScanError::ProtoIncomplete {
+                        present: "proto_file",
+                        missing: "proto_message",
+                    }));
+                }
+                (false, false) => {
+                    return Err(Box::new(ScanError::ProtoIncomplete {
+                        present: "proto_extract",
+                        missing: "proto_file and proto_message",
+                    }));
+                }
+                (true, true) => {}
             }
             // format => 'json' serializes the whole message, so it needs no named
             // fields; proto_extract is otherwise required.

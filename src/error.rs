@@ -57,8 +57,13 @@ pub enum ScanError {
         /// Leading `": ..."` hint suggesting the JSON decoder, or empty.
         hint: String,
     },
-    #[error("proto_extract requires both proto_file and proto_message")]
-    ProtoIncomplete,
+    #[error("{present} requires {missing} (both are needed to decode a protobuf payload)")]
+    ProtoIncomplete {
+        /// The proto parameter that was supplied.
+        present: &'static str,
+        /// The proto parameter that must also be supplied.
+        missing: &'static str,
+    },
     #[error("proto_file/proto_message require a non-empty proto_extract list")]
     ProtoNoFields,
     #[error("durable and ephemeral consumer modes are mutually exclusive")]
