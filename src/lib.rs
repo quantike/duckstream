@@ -139,6 +139,30 @@ struct ReadJetstreamInitData {
     inner: Mutex<ScanState>,
 }
 
+/// Drain the scan connection before the runtime is dropped.
+///
+/// Without this, dropping the [`Runtime`] blocks the DuckDB thread until
+/// `async-nats`'s background connection task stops on its own, which waits on a
+/// broker-side idle timeout and delays process exit (see issue #10). Draining
+/// closes the connection deterministically so that task exits at once.
+///
+/// Only the scan path holds a client; consumers have nothing to drain.
+impl Drop for ReadJetstreamInitData {
+    fn drop(&mut self) {
+        let Ok(state) = self.inner.get_mut() else {
+            return;
+        };
+        if let Source::Scan { client, .. } = &state.source {
+            let client = client.clone();
+            // Bounded so a broker that never acknowledges the drain cannot
+            // reintroduce the very hang this teardown removes.
+            let _ = self.runtime.block_on(async {
+                tokio::time::timeout(std::time::Duration::from_secs(5), client.drain()).await
+            });
+        }
+    }
+}
+
 /// Mutable read progress, guarded by the init data's mutex.
 ///
 /// Despite the name, this backs both the Direct Get scan path and the ephemeral
@@ -170,7 +194,12 @@ struct ScanState {
 enum Source {
     /// Stateless Direct Get scan over a bounded sequence range.
     Scan {
-        stream: jetstream::stream::Stream,
+        /// Retained so teardown can drain it; see [`ReadJetstreamInitData`]'s
+        /// [`Drop`].
+        client: async_nats::Client,
+        /// Boxed: `Stream` is large, and an unboxed variant trips
+        /// `clippy::large_enum_variant`.
+        stream: Box<jetstream::stream::Stream>,
         /// Next sequence to fetch (inclusive).
         current_seq: u64,
         /// Last sequence to fetch (inclusive).
@@ -179,7 +208,8 @@ enum Source {
     /// Bounded drain of a pull consumer (ephemeral or durable), up to the
     /// messages that existed when the consumer was created.
     Consumer {
-        consumer: jetstream::consumer::PullConsumer,
+        /// Boxed for the same reason as [`Source::Scan`]'s `stream`.
+        consumer: Box<jetstream::consumer::PullConsumer>,
         /// Messages left to drain. Seeded from the consumer's `num_pending` at
         /// creation, capped by `max_messages` when set. Reaching zero ends the
         /// read.
@@ -487,7 +517,7 @@ impl VTab for ReadJetstream {
                 proto_fields: bind_data.proto_fields.clone(),
                 done: setup.pending == 0,
                 source: Source::Consumer {
-                    consumer: setup.consumer,
+                    consumer: Box::new(setup.consumer),
                     remaining: setup.pending,
                     batch: setup.batch,
                     ack: setup.ack,
@@ -516,7 +546,9 @@ impl VTab for ReadJetstream {
                         url: bind_data.url.clone(),
                         source,
                     })?;
-                let context = jetstream::new(client);
+                // Retain the client so teardown can drain it; `Context` clones
+                // it internally, so this keeps a handle without a second connect.
+                let context = jetstream::new(client.clone());
 
                 let stream = context.get_stream(&bind_data.stream).await.map_err(|e| {
                     ScanError::StreamInfo {
@@ -583,7 +615,8 @@ impl VTab for ReadJetstream {
                     proto_fields: bind_data.proto_fields.clone(),
                     done: last_sequence == 0 || end_seq == 0 || current_seq > end_seq,
                     source: Source::Scan {
-                        stream,
+                        client,
+                        stream: Box::new(stream),
                         current_seq,
                         end_seq,
                     },
@@ -619,6 +652,7 @@ impl VTab for ReadJetstream {
 
         match &mut state.source {
             Source::Scan {
+                client: _,
                 stream,
                 current_seq,
                 end_seq,
