@@ -61,10 +61,8 @@ const DEFAULT_URL: &str = "nats://localhost:4222";
 /// `batch` parameter is not provided. Applies to ephemeral and durable modes.
 const DEFAULT_BATCH: u64 = 256;
 
-/// Ceiling on the scan-teardown drain (see [`ReadJetstreamInitData`]'s
-/// [`Drop`]). Matches `async-nats`'s default `connection_timeout` of 5s; a drain
-/// that has not completed by then is against an unresponsive broker and is
-/// abandoned so process exit stays bounded.
+/// Ceiling on scan teardown (see [`ReadJetstreamInitData`]'s [`Drop`]). Matches
+/// `async-nats`'s default `connection_timeout` of 5s.
 const SCAN_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Apply the optional `max_messages` hard cap to a consumer's pending count.
@@ -141,31 +139,34 @@ struct ConsumerSetup {
 /// Execution state, shared across DuckDB worker threads via the init data's
 /// mutex.
 struct ReadJetstreamInitData {
-    runtime: Runtime,
+    /// `Option` so [`Drop`] can `take` it for [`Runtime::shutdown_timeout`];
+    /// always `Some` outside teardown.
+    runtime: Option<Runtime>,
     inner: Mutex<ScanState>,
 }
 
-/// Drain the scan connection before the runtime is dropped.
+/// Drain the scan connection, then bound the runtime shutdown.
 ///
-/// Without this, dropping the [`Runtime`] blocks the DuckDB thread until
-/// `async-nats`'s background connection task stops on its own, which waits on a
-/// broker-side idle timeout and delays process exit (see issue #10). Draining
-/// closes the connection deterministically so that task exits at once.
+/// Dropping the [`Runtime`] otherwise blocks the DuckDB thread until
+/// `async-nats`'s background connection task stops on a broker-side idle
+/// timeout, delaying process exit (issue #10). The drain closes the connection
+/// so that task exits at once. [`Client::drain`] only enqueues the command and
+/// returns, so the ceiling comes from [`Runtime::shutdown_timeout`], not the
+/// drain: an unresponsive broker cannot delay exit past [`SCAN_DRAIN_TIMEOUT`].
 ///
 /// Only the scan path holds a client; consumers have nothing to drain.
 impl Drop for ReadJetstreamInitData {
     fn drop(&mut self) {
-        let Ok(state) = self.inner.get_mut() else {
+        let Some(runtime) = self.runtime.take() else {
             return;
         };
-        if let Source::Scan { client, .. } = &state.source {
-            let client = client.clone();
-            // Bounded so a broker that never acknowledges the drain cannot
-            // reintroduce the very hang this teardown removes.
-            let _ = self
-                .runtime
-                .block_on(async { tokio::time::timeout(SCAN_DRAIN_TIMEOUT, client.drain()).await });
+        if let Ok(state) = self.inner.get_mut() {
+            if let Source::Scan { client, .. } = &state.source {
+                let client = client.clone();
+                let _ = runtime.block_on(client.drain());
+            }
         }
+        runtime.shutdown_timeout(SCAN_DRAIN_TIMEOUT);
     }
 }
 
@@ -531,7 +532,7 @@ impl VTab for ReadJetstream {
             };
 
             return Ok(ReadJetstreamInitData {
-                runtime: setup.runtime,
+                runtime: Some(setup.runtime),
                 inner: Mutex::new(state),
             });
         }
@@ -630,7 +631,7 @@ impl VTab for ReadJetstream {
             })?;
 
         Ok(ReadJetstreamInitData {
-            runtime,
+            runtime: Some(runtime),
             inner: Mutex::new(state),
         })
     }
@@ -676,12 +677,16 @@ impl VTab for ReadJetstream {
                     // (multi-message request) or a pull-consumer drain would cut
                     // the round-trips dramatically; the consumer path below
                     // already fetches in batches for this reason.
-                    let fetched = init.runtime.block_on(async {
-                        match stream.direct_get(seq).await {
-                            Ok(msg) => Some(msg),
-                            Err(_) => stream.get_raw_message(seq).await.ok(),
-                        }
-                    });
+                    let fetched = init
+                        .runtime
+                        .as_ref()
+                        .expect("runtime present outside drop")
+                        .block_on(async {
+                            match stream.direct_get(seq).await {
+                                Ok(msg) => Some(msg),
+                                Err(_) => stream.get_raw_message(seq).await.ok(),
+                            }
+                        });
                     let Some(msg) = fetched else {
                         continue;
                     };
@@ -719,37 +724,43 @@ impl VTab for ReadJetstream {
                     // Fine for bounded drains, but each request has round-trip
                     // latency; for very large streams a persistent pull
                     // subscription reused across func calls would amortize that.
-                    let fetched: Vec<Row> = init.runtime.block_on(async {
-                        let mut out = Vec::with_capacity(want);
-                        // `fetch` uses no_wait: returns what is available now and
-                        // ends, so this drains without blocking indefinitely.
-                        if let Ok(mut msgs) = consumer.fetch().max_messages(want).messages().await {
-                            while let Some(Ok(msg)) = msgs.next().await {
-                                let (seq, ts_micros) = match msg.info() {
-                                    Ok(info) => (
-                                        info.stream_sequence,
-                                        (info.published.unix_timestamp_nanos() / 1_000) as i64,
-                                    ),
-                                    Err(_) => (0, 0),
-                                };
-                                // At-least-once: acking before the row reaches
-                                // DuckDB means a query cancelled after this point
-                                // still counts the message as consumed. A crash
-                                // between fetch and ack (or an ignored ack error)
-                                // just redelivers on the next run.
-                                if ack {
-                                    let _ = msg.ack().await;
+                    let fetched: Vec<Row> = init
+                        .runtime
+                        .as_ref()
+                        .expect("runtime present outside drop")
+                        .block_on(async {
+                            let mut out = Vec::with_capacity(want);
+                            // `fetch` uses no_wait: returns what is available now and
+                            // ends, so this drains without blocking indefinitely.
+                            if let Ok(mut msgs) =
+                                consumer.fetch().max_messages(want).messages().await
+                            {
+                                while let Some(Ok(msg)) = msgs.next().await {
+                                    let (seq, ts_micros) = match msg.info() {
+                                        Ok(info) => (
+                                            info.stream_sequence,
+                                            (info.published.unix_timestamp_nanos() / 1_000) as i64,
+                                        ),
+                                        Err(_) => (0, 0),
+                                    };
+                                    // At-least-once: acking before the row reaches
+                                    // DuckDB means a query cancelled after this point
+                                    // still counts the message as consumed. A crash
+                                    // between fetch and ack (or an ignored ack error)
+                                    // just redelivers on the next run.
+                                    if ack {
+                                        let _ = msg.ack().await;
+                                    }
+                                    out.push(Row::new(
+                                        msg.message.subject.clone(),
+                                        seq,
+                                        ts_micros,
+                                        msg.message.payload.clone(),
+                                    ));
                                 }
-                                out.push(Row::new(
-                                    msg.message.subject.clone(),
-                                    seq,
-                                    ts_micros,
-                                    msg.message.payload.clone(),
-                                ));
                             }
-                        }
-                        out
-                    });
+                            out
+                        });
 
                     *remaining = remaining.saturating_sub(fetched.len() as u64);
                     rows = fetched;
