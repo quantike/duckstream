@@ -61,6 +61,12 @@ const DEFAULT_URL: &str = "nats://localhost:4222";
 /// `batch` parameter is not provided. Applies to ephemeral and durable modes.
 const DEFAULT_BATCH: u64 = 256;
 
+/// Ceiling on the scan-teardown drain (see [`ReadJetstreamInitData`]'s
+/// [`Drop`]). Matches `async-nats`'s default `connection_timeout` of 5s; a drain
+/// that has not completed by then is against an unresponsive broker and is
+/// abandoned so process exit stays bounded.
+const SCAN_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Apply the optional `max_messages` hard cap to a consumer's pending count.
 ///
 /// Returns the number of messages the drain should emit: `pending` when no cap
@@ -156,9 +162,9 @@ impl Drop for ReadJetstreamInitData {
             let client = client.clone();
             // Bounded so a broker that never acknowledges the drain cannot
             // reintroduce the very hang this teardown removes.
-            let _ = self.runtime.block_on(async {
-                tokio::time::timeout(std::time::Duration::from_secs(5), client.drain()).await
-            });
+            let _ = self
+                .runtime
+                .block_on(async { tokio::time::timeout(SCAN_DRAIN_TIMEOUT, client.drain()).await });
         }
     }
 }
