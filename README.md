@@ -82,9 +82,10 @@ stream, or `proto_*` at a JSON stream. Set `ignore_errors => true` to tolerate m
 undecodable rows are still emitted with NULL extracted columns.
 
 ```sql
--- Scan a sequence range
+-- Scan a sequence range. payload defaults to BLOB (renders as \xNN-escaped hex);
+-- use format => 'json' (or 'text') to read it as text.
 SELECT seq, subject, payload
-FROM read_jetstream('ORDERS', start_seq => 1, end_seq => 100);
+FROM read_jetstream('ORDERS', start_seq => 1, end_seq => 100, format => 'json');
 
 -- Ephemeral consumer: read everything currently in the stream (with a progress bar)
 SELECT count(*) FROM read_jetstream('ORDERS', ephemeral => true);
