@@ -2,11 +2,14 @@
 //!
 //! This module holds the pure, network-free logic that turns user-supplied
 //! parameters into typed configuration: the [`StartSpec`] delivery-policy
-//! selector, NATS [`subject_matches`] token matching, and DuckDB timestamp
-//! parsing ([`parse_timestamp_micros`]). Keeping these free of I/O makes them
-//! directly unit-testable without a live NATS server.
+//! selector, NATS [`subject_matches`] token matching, DuckDB timestamp parsing
+//! ([`parse_timestamp_micros`]), and the [`BindParams`] aggregate that pulls
+//! every named parameter off a [`BindInfo`] and cross-validates it. Keeping
+//! these free of I/O makes them directly unit-testable without a live NATS
+//! server.
 
 use async_nats::jetstream;
+use duckdb::vtab::BindInfo;
 
 use crate::error::ScanError;
 
@@ -147,6 +150,212 @@ pub fn parse_timestamp_micros(s: &str) -> Result<i64, ScanError> {
 
     let nanos = parsed.assume_utc().unix_timestamp_nanos();
     Ok((nanos / 1_000) as i64)
+}
+
+/// Every parsed and cross-validated `read_jetstream` parameter except the
+/// derived protobuf descriptor/fields and the live consumer setup, which are
+/// built from these params in `bind`.
+///
+/// Construct via [`BindParams::from_bind`], which performs all extraction and
+/// validation so `bind` is left with column declaration and consumer creation.
+pub struct BindParams {
+    pub stream: String,
+    pub url: String,
+    pub subject: Option<String>,
+    pub start_seq: Option<u64>,
+    pub end_seq: Option<u64>,
+    pub start_time_micros: Option<i64>,
+    pub end_time_micros: Option<i64>,
+    pub json_fields: Vec<String>,
+    pub format: PayloadFormat,
+    pub ignore_errors: bool,
+    pub proto_file: Option<String>,
+    pub proto_message: Option<String>,
+    pub proto_paths: Vec<String>,
+    pub ephemeral: bool,
+    pub durable: Option<String>,
+    pub batch: u64,
+    pub max_messages: Option<u64>,
+    pub start: Option<StartSpec>,
+}
+
+impl BindParams {
+    /// True when the call uses the protobuf decode path (any proto_ parameter
+    /// supplied). When true, `proto_file` and `proto_message` must both be set.
+    pub fn using_proto(&self) -> bool {
+        !self.proto_paths.is_empty() || self.proto_file.is_some() || self.proto_message.is_some()
+    }
+
+    /// True when the call uses a JetStream consumer (ephemeral or durable)
+    /// rather than the stateless Direct Get scan.
+    pub fn is_consumer(&self) -> bool {
+        self.ephemeral || self.durable.is_some()
+    }
+
+    /// Extract and cross-validate every `read_jetstream` parameter from a
+    /// [`BindInfo`]. Returns [`ScanError`] for any invalid combination.
+    pub fn from_bind(bind: &BindInfo) -> Result<Self, ScanError> {
+        let json_fields: Vec<String> = bind
+            .get_named_parameter("json_extract")
+            .and_then(|v| v.to_list())
+            .map(|items| items.iter().map(|v| v.to_string()).collect())
+            .unwrap_or_default();
+
+        let ignore_errors = bind
+            .get_named_parameter("ignore_errors")
+            .map(|v| v.to_bool())
+            .unwrap_or(false);
+
+        let proto_file = bind
+            .get_named_parameter("proto_file")
+            .map(|v| v.to_string());
+        let proto_message = bind
+            .get_named_parameter("proto_message")
+            .map(|v| v.to_string());
+        let proto_paths: Vec<String> = bind
+            .get_named_parameter("proto_extract")
+            .and_then(|v| v.to_list())
+            .map(|items| items.iter().map(|v| v.to_string()).collect())
+            .unwrap_or_default();
+
+        let format = bind
+            .get_named_parameter("format")
+            .map(|v| PayloadFormat::parse(&v.to_string()))
+            .transpose()?
+            .unwrap_or_default();
+
+        if !json_fields.is_empty() && !proto_paths.is_empty() {
+            return Err(ScanError::DecodeConflict);
+        }
+        if Self::proto_incomplete(
+            proto_file.is_some(),
+            proto_message.is_some(),
+            !proto_paths.is_empty(),
+        )? {
+            // format => 'json' serializes the whole message, so it needs no
+            // named fields; proto_extract is otherwise required.
+            if proto_paths.is_empty() && format != PayloadFormat::Json {
+                return Err(ScanError::ProtoNoFields);
+            }
+        }
+
+        let stream = bind.get_parameter(0).to_string();
+
+        let url = bind
+            .get_named_parameter("url")
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| super::DEFAULT_URL.to_string());
+
+        let subject = bind
+            .get_named_parameter("subject")
+            .map(|v| {
+                let s = v.to_string();
+                if async_nats::Subject::from(s.clone()).is_valid() {
+                    Ok(s)
+                } else {
+                    Err(ScanError::InvalidSubject { value: s })
+                }
+            })
+            .transpose()?;
+
+        let start_seq = bind.get_named_parameter("start_seq").map(|v| v.to_uint64());
+        let end_seq = bind.get_named_parameter("end_seq").map(|v| v.to_uint64());
+        // TIMESTAMP values cannot be read via the primitive integer getters,
+        // so parse DuckDB's canonical string rendering into epoch microseconds.
+        let start_time_micros = bind
+            .get_named_parameter("start_time")
+            .map(|v| parse_timestamp_micros(&v.to_string()))
+            .transpose()?;
+        let end_time_micros = bind
+            .get_named_parameter("end_time")
+            .map(|v| parse_timestamp_micros(&v.to_string()))
+            .transpose()?;
+
+        let ephemeral = bind
+            .get_named_parameter("ephemeral")
+            .map(|v| v.to_bool())
+            .unwrap_or(false);
+        let durable = bind
+            .get_named_parameter("durable")
+            .map(|v| v.to_string())
+            .filter(|s| !s.is_empty());
+
+        let batch_param = bind.get_named_parameter("batch").map(|v| v.to_uint64());
+        let max_messages = bind
+            .get_named_parameter("max_messages")
+            .map(|v| v.to_uint64());
+
+        let is_consumer = ephemeral || durable.is_some();
+        if ephemeral && durable.is_some() {
+            return Err(ScanError::ModeConflict);
+        }
+        if batch_param.is_some() && !is_consumer {
+            return Err(ScanError::ConsumerOnlyParam { param: "batch" });
+        }
+        if max_messages.is_some() && !is_consumer {
+            return Err(ScanError::ConsumerOnlyParam {
+                param: "max_messages",
+            });
+        }
+        if batch_param == Some(0) {
+            return Err(ScanError::ZeroBatch);
+        }
+
+        let start = bind
+            .get_named_parameter("start")
+            .map(|v| StartSpec::parse(&v.to_string()))
+            .transpose()?;
+
+        Ok(Self {
+            stream,
+            url,
+            subject,
+            start_seq,
+            end_seq,
+            start_time_micros,
+            end_time_micros,
+            json_fields,
+            format,
+            ignore_errors,
+            proto_file,
+            proto_message,
+            proto_paths,
+            ephemeral,
+            durable,
+            batch: batch_param.unwrap_or(super::DEFAULT_BATCH),
+            max_messages,
+            start,
+        })
+    }
+
+    /// Validate the proto_file/proto_message/proto_extract triple, returning
+    /// `Ok(true)` when the protobuf path is in use, `Ok(false)` when it is not,
+    /// and `Err` for any incomplete combination.
+    fn proto_incomplete(
+        has_file: bool,
+        has_message: bool,
+        has_paths: bool,
+    ) -> Result<bool, ScanError> {
+        let using = has_file || has_message || has_paths;
+        if !using {
+            return Ok(false);
+        }
+        match (has_file, has_message) {
+            (false, true) => Err(ScanError::ProtoIncomplete {
+                present: "proto_message",
+                missing: "proto_file",
+            }),
+            (true, false) => Err(ScanError::ProtoIncomplete {
+                present: "proto_file",
+                missing: "proto_message",
+            }),
+            (false, false) => Err(ScanError::ProtoIncomplete {
+                present: "proto_extract",
+                missing: "proto_file and proto_message",
+            }),
+            (true, true) => Ok(true),
+        }
+    }
 }
 
 #[cfg(test)]
