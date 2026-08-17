@@ -156,11 +156,11 @@ duckdb -unsigned -cmd "LOAD '$PWD/build/debug/duckstream.duckdb_extension'"
 
 ```sh
 cargo test --lib   # Rust unit tests (network-free)
-make test_debug    # SQL smoke test via DuckDB's SQLLogicTest runner
+cargo test --test integration   # SQL + broker: load, register, scan, snapshot
 ```
 
-The unit tests and the SQL smoke test need no broker; the smoke test only verifies
-that the extension loads and registers its functions.
+The unit tests need no broker. The integration tests build the extension and run
+real SQL against a live NATS JetStream broker, asserting on snapshotted output.
 
 ### Integration tests
 
