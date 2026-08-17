@@ -1,6 +1,6 @@
 # Every target here is a task, not a file. Some (clean, configure) share a name
 # with a directory in the tree, so .PHONY is required, not cosmetic.
-.PHONY: configure debug release clean
+.PHONY: configure debug release test_debug test_release clean
 
 PROJ_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 
@@ -29,5 +29,10 @@ configure: venv platform extension_version
 
 debug: build_extension_library_debug build_extension_with_metadata_debug
 release: build_extension_library_release build_extension_with_metadata_release
+
+# Aliases for the ci-tools test targets. The distribution pipeline calls
+# `make test_<build_type>` (default: test_release) inside its build container.
+test_debug: test_extension_debug
+test_release: test_extension_release
 
 clean: clean_build clean_rust
