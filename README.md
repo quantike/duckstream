@@ -5,82 +5,76 @@
 
 A DuckDB extension for querying [NATS JetStream](https://docs.nats.io/nats-concepts/jetstream) with SQL.
 
-Written in Rust on top of DuckDB's [C Extension API](https://duckdb.org/docs/stable/clients/c/overview),
-targeting DuckDB v1.5.5.
+Written in Rust on top of DuckDB's [C Extension API](https://duckdb.org/docs/stable/clients/c/overview), targeting
+DuckDB v1.5.5.
 
 ## Features
 
-- Bounded reads over a JetStream stream by sequence (`start_seq`/`end_seq`) or timestamp
-  (`start_time`/`end_time`).
-- Three read modes: a stateless scan (JetStream Direct Get), an ephemeral consumer that drains
-  everything currently in the stream, and a durable consumer that persists a cursor and resumes
-  from where the last run left off. Both consumer modes report progress.
+- Bounded reads over a JetStream stream by sequence (`start_seq`/`end_seq`) or timestamp (`start_time`/`end_time`).
+- Three read modes: a stateless scan (JetStream Direct Get), an ephemeral consumer that drains everything currently in
+  the stream, and a durable consumer that persists a cursor and resumes from where the last run left off. Both consumer
+  modes report progress.
 - Subject filtering with NATS token semantics (`*` matches one token, `>` matches trailing tokens).
-- JSON extraction: name JSON field paths (dot notation for nested fields) and get one column each.
-  Scalars render as their natural value, nested values as JSON text.
-- Protocol Buffers extraction: supply a `.proto` schema at query time (compiled in pure Rust, no
-  `protoc` binary required) and get columns whose types are derived from the schema (`UBIGINT`,
-  `DOUBLE`, `BOOLEAN`, and so on), including nested-field descent.
+- JSON extraction: name JSON field paths (dot notation for nested fields) and get one column each. Scalars render as
+  their natural value, nested values as JSON text.
+- Protocol Buffers extraction: supply a `.proto` schema at query time (compiled in pure Rust, no `protoc` binary
+  required) and get columns whose types are derived from the schema (`UBIGINT`, `DOUBLE`, `BOOLEAN`, and so on),
+  including nested-field descent.
 
 ## SQL API
 
-The extension registers the `read_jetstream` table function. It returns five base columns (`stream`,
-`subject`, `seq`, `ts_nats`, `payload`) plus one extra column per extracted JSON or protobuf field.
+The extension registers the `read_jetstream` table function. It returns five base columns (`stream`, `subject`, `seq`,
+`ts_nats`, `payload`) plus one extra column per extracted JSON or protobuf field.
 
 ### `read_jetstream(stream, ...)`
 
 A bounded read that always completes. It runs in one of three modes:
 
-- Scan (default): a stateless read by sequence or timestamp range, using the JetStream Direct Get
-  API.
-- Ephemeral consumer (`ephemeral => true`): creates a throwaway JetStream consumer that drains every
-  message in the stream up to the moment of the query, then completes.
-- Durable consumer (`durable => 'name'`): creates or attaches a named, server-persisted consumer.
-  Each run reads only the messages that arrived since the last run, resuming from the stored cursor.
+- Scan (default): a stateless read by sequence or timestamp range, using the JetStream Direct Get API.
+- Ephemeral consumer (`ephemeral => true`): creates a throwaway JetStream consumer that drains every message in the
+  stream up to the moment of the query, then completes.
+- Durable consumer (`durable => 'name'`): creates or attaches a named, server-persisted consumer. Each run reads only
+  the messages that arrived since the last run, resuming from the stored cursor.
 
-Both consumer modes report their message count as the query cardinality, so DuckDB shows a progress
-bar, and apply the subject filter server-side.
+Both consumer modes report their message count as the query cardinality, so DuckDB shows a progress bar, and apply the
+subject filter server-side.
 
-| Parameter       | Type      | Description                                                                                             |
-| --------------- | --------- | ------------------------------------------------------------------------------------------------------- |
-| `stream`        | VARCHAR   | Stream name (positional, required).                                                                     |
-| `url`           | VARCHAR   | NATS server URL. Default `nats://localhost:4222`.                                                       |
-| `ephemeral`     | BOOLEAN   | `true` reads via an ephemeral consumer instead of a scan. Default `false`.                              |
-| `durable`       | VARCHAR   | Consumer name. Selects durable mode. Mutually exclusive with `ephemeral`.                               |
-| `subject`       | VARCHAR   | NATS subject filter, wildcards allowed (`*`, `>`). Applied client-side in scan mode, server-side in consumer modes. |
-| `start_seq`     | UBIGINT   | Start sequence (inclusive). Scan mode, or `start => 'by_start_seq'`.                                    |
-| `end_seq`       | UBIGINT   | End sequence (inclusive). Scan mode.                                                                    |
-| `start_time`    | TIMESTAMP | Start time (inclusive). Scan mode, or `start => 'by_start_time'`.                                       |
-| `end_time`      | TIMESTAMP | End time (inclusive). Scan mode.                                                                        |
-| `start`         | VARCHAR   | Starting point for a new consumer: `all` (default), `new`, `last`, `by_start_seq`, `by_start_time`. Honored only when the consumer is first created. Consumer modes. |
-| `batch`         | UBIGINT   | Messages requested per `fetch` while draining. Default `256`. Consumer modes.                          |
-| `max_messages`  | UBIGINT   | Hard cap on the number of rows returned. Consumer modes.                                               |
-| `json_extract`  | VARCHAR[] | JSON field paths, each mapped to a VARCHAR column.                                                      |
-| `proto_file`    | VARCHAR   | Path to a `.proto` schema file.                                                                         |
-| `proto_message` | VARCHAR   | Message type name within the schema.                                                                    |
-| `proto_extract` | VARCHAR[] | Protobuf field paths, each mapped to a schema-typed column.                                             |
+| Parameter       | Type      | Description                                                                                                                                                                   |
+| --------------- | --------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `stream`        | VARCHAR   | Stream name (positional, required).                                                                                                                                           |
+| `url`           | VARCHAR   | NATS server URL. Default `nats://localhost:4222`.                                                                                                                             |
+| `ephemeral`     | BOOLEAN   | `true` reads via an ephemeral consumer instead of a scan. Default `false`.                                                                                                    |
+| `durable`       | VARCHAR   | Consumer name. Selects durable mode. Mutually exclusive with `ephemeral`.                                                                                                     |
+| `subject`       | VARCHAR   | NATS subject filter, wildcards allowed (`*`, `>`). Applied client-side in scan mode, server-side in consumer modes.                                                           |
+| `start_seq`     | UBIGINT   | Start sequence (inclusive). Scan mode, or `start => 'by_start_seq'`.                                                                                                          |
+| `end_seq`       | UBIGINT   | End sequence (inclusive). Scan mode.                                                                                                                                          |
+| `start_time`    | TIMESTAMP | Start time (inclusive). Scan mode, or `start => 'by_start_time'`.                                                                                                             |
+| `end_time`      | TIMESTAMP | End time (inclusive). Scan mode.                                                                                                                                              |
+| `start`         | VARCHAR   | Starting point for a new consumer: `all` (default), `new`, `last`, `by_start_seq`, `by_start_time`. Honored only when the consumer is first created. Consumer modes.          |
+| `batch`         | UBIGINT   | Messages requested per `fetch` while draining. Default `256`. Consumer modes.                                                                                                 |
+| `max_messages`  | UBIGINT   | Hard cap on the number of rows returned. Consumer modes.                                                                                                                      |
+| `json_extract`  | VARCHAR[] | JSON field paths, each mapped to a VARCHAR column.                                                                                                                            |
+| `proto_file`    | VARCHAR   | Path to a `.proto` schema file.                                                                                                                                               |
+| `proto_message` | VARCHAR   | Message type name within the schema.                                                                                                                                          |
+| `proto_extract` | VARCHAR[] | Protobuf field paths, each mapped to a schema-typed column.                                                                                                                   |
 | `format`        | VARCHAR   | Type of the `payload` column: `blob` (default), `text`, or `json`. `json` emits VARCHAR aliased `JSON`, so the `json` extension operators (`->`, `->>`) apply without a cast. |
-| `ignore_errors` | BOOLEAN   | When `true`, payloads that fail to decode leave the affected columns NULL instead of failing the query. Default `false`. |
+| `ignore_errors` | BOOLEAN   | When `true`, payloads that fail to decode leave the affected columns NULL instead of failing the query. Default `false`.                                                      |
 
-`json_extract` and `proto_extract` cannot be used together. `proto_extract` requires both
-`proto_file` and `proto_message`. `durable` and `ephemeral` cannot be used together.
-`batch` and `max_messages` apply only to consumer modes. Durable consumers ack each message
-on emit, advancing the cursor (at-least-once: a cancelled query redelivers unacked messages
-on the next run).
+`json_extract` and `proto_extract` cannot be used together. `proto_extract` requires both `proto_file` and
+`proto_message`. `durable` and `ephemeral` cannot be used together. `batch` and `max_messages` apply only to consumer
+modes. Durable consumers ack each message on emit, advancing the cursor (at-least-once: a cancelled query redelivers
+unacked messages on the next run).
 
-`format` sets the type of the whole `payload` column and is independent of the `json_extract`/`proto_*`
-projections (which add their own columns), so it composes with either. `format => 'json'` on a JSON
-stream is lazy: bytes are emitted unparsed and DuckDB validates on access, except that `ignore_errors`
-drops clearly-non-JSON payloads to NULL. `format => 'text'` requires valid UTF-8; a non-UTF-8 payload
-fails the query unless `ignore_errors => true`, which drops it to NULL. Supplying
-`proto_file`/`proto_message` with `format => 'json'` decodes each message and serializes it to the
-`payload` column (field names verbatim from the `.proto`), so `proto_extract` is not required in that
-case.
+`format` sets the type of the whole `payload` column and is independent of the `json_extract`/`proto_*` projections
+(which add their own columns), so it composes with either. `format => 'json'` on a JSON stream is lazy: bytes are
+emitted unparsed and DuckDB validates on access, except that `ignore_errors` drops clearly-non-JSON payloads to NULL.
+`format => 'text'` requires valid UTF-8; a non-UTF-8 payload fails the query unless `ignore_errors => true`, which drops
+it to NULL. Supplying `proto_file`/`proto_message` with `format => 'json'` decodes each message and serializes it to the
+`payload` column (field names verbatim from the `.proto`), so `proto_extract` is not required in that case.
 
-By default, a payload that does not match the chosen decoder fails the query, naming the stream and
-sequence and pointing at the other decoder. This catches pointing `json_extract` at a protobuf
-stream, or `proto_*` at a JSON stream. Set `ignore_errors => true` to tolerate mixed streams;
-undecodable rows are still emitted with NULL extracted columns.
+By default, a payload that does not match the chosen decoder fails the query, naming the stream and sequence and
+pointing at the other decoder. This catches pointing `json_extract` at a protobuf stream, or `proto_*` at a JSON stream.
+Set `ignore_errors => true` to tolerate mixed streams; undecodable rows are still emitted with NULL extracted columns.
 
 ```sql
 -- Scan a sequence range. payload defaults to BLOB (renders as \xNN-escaped hex);
@@ -117,9 +111,9 @@ FROM read_jetstream('ORDERS', format => 'json');
 
 ## Building
 
-This is a DuckDB loadable extension, so `cargo build` alone is not enough. DuckDB loads a
-`.duckdb_extension` file carrying a version-matched metadata footer, which is appended by DuckDB's
-`extension-ci-tools` flow. Clone with submodules, then use the `Makefile`:
+This is a DuckDB loadable extension, so `cargo build` alone is not enough. DuckDB loads a `.duckdb_extension` file
+carrying a version-matched metadata footer, which is appended by DuckDB's `extension-ci-tools` flow. Clone with
+submodules, then use the `Makefile`:
 
 ```sh
 git clone --recurse-submodules https://github.com/quantike/duckstream.git
@@ -127,16 +121,15 @@ make configure   # set up a Python venv and the DuckDB test runner, detect the p
 make debug       # cargo build, then append the .duckdb_extension footer
 ```
 
-The built extension is written to `build/debug/duckstream.duckdb_extension`. Use `make release` for
-an optimized build.
+The built extension is written to `build/debug/duckstream.duckdb_extension`. Use `make release` for an optimized build.
 
-The extension is built against a single DuckDB version (v1.5.5) because it uses DuckDB's unstable C
-API via `duckdb-rs`. The produced binary loads only into that exact DuckDB version.
+The extension is built against a single DuckDB version (v1.5.5) because it uses DuckDB's unstable C API via `duckdb-rs`.
+The produced binary loads only into that exact DuckDB version.
 
 ### Loading
 
-A locally built (unsigned) extension requires the `-unsigned` flag. macOS refuses to load an
-extension by relative path, so use an absolute path:
+A locally built (unsigned) extension requires the `-unsigned` flag. macOS refuses to load an extension by relative path,
+so use an absolute path:
 
 ```sh
 duckdb -unsigned
@@ -160,19 +153,17 @@ cargo test --lib   # Rust unit tests (network-free)
 cargo test --test integration   # SQL + broker: load, register, scan, snapshot
 ```
 
-The unit tests need no broker. The integration tests build the extension and run
-real SQL against a live NATS JetStream broker, asserting on snapshotted output.
+The unit tests need no broker. The integration tests build the extension and run real SQL against a live NATS JetStream
+broker, asserting on snapshotted output.
 
 ### Integration tests
 
-`tests/integration.rs` runs the built `.duckdb_extension` against a live NATS
-JetStream broker and asserts on real SQL output. Each case seeds a stream with
-`async-nats`, runs a committed `.sql` file (under `tests/cases/`) through the
-`duckdb` CLI (csv output) with the extension loaded, and snapshots the result
-with [`insta`](https://insta.rs). The extension is driven as a subprocess because
-this crate builds `duckdb` with the `loadable-extension` feature, which cannot
-also be used as an in-process client. Cases share one broker but each uses a
-unique stream name and subject prefix, so they run in parallel without colliding.
+`tests/integration.rs` runs the built `.duckdb_extension` against a live NATS JetStream broker and asserts on real SQL
+output. Each case seeds a stream with `async-nats`, runs a committed `.sql` file (under `tests/cases/`) through the
+`duckdb` CLI (csv output) with the extension loaded, and snapshots the result with [`insta`](https://insta.rs). The
+extension is driven as a subprocess because this crate builds `duckdb` with the `loadable-extension` feature, which
+cannot also be used as an in-process client. Cases share one broker but each uses a unique stream name and subject
+prefix, so they run in parallel without colliding.
 
 ```sh
 make debug                    # build the extension the tests load
@@ -181,29 +172,24 @@ cargo test --test integration
 
 Requirements:
 
-- A built extension at `build/debug/duckstream.duckdb_extension`, or `DUCKSTREAM_EXT`
-  pointing at one. If missing, the tests skip rather than fail.
+- A built extension at `build/debug/duckstream.duckdb_extension`, or `DUCKSTREAM_EXT` pointing at one. If missing, the
+  tests skip rather than fail.
 - A `duckdb` binary on `PATH` (or `DUCKDB_BIN`), matching the build version (v1.5.5).
-- A broker: either Docker (a `nats:2.10.14 --jetstream` container is started
-  automatically), or set `NATS_URL` to reuse a local `nats-server -js`:
+- A broker: either Docker (a `nats:2.10.14 --jetstream` container is started automatically), or set `NATS_URL` to reuse
+  a local `nats-server -js`:
 
   ```sh
   nats-server -js &
   NATS_URL=nats://localhost:4222 cargo test --test integration
   ```
 
-Snapshots live in `tests/snapshots/` and are reviewed with `cargo insta review`.
-The `.sql` files stay runnable by hand; they use `${NATS_URL}`, `${STREAM}`, and
-`${SUBJECT_PREFIX}` placeholders the harness substitutes. CI runs this suite in
+Snapshots live in `tests/snapshots/` and are reviewed with `cargo insta review`. The `.sql` files stay runnable by hand;
+they use `${NATS_URL}`, `${STREAM}`, and `${SUBJECT_PREFIX}` placeholders the harness substitutes. CI runs this suite in
 `integration.yml`.
 
-Note: against the Docker broker the scan-mode cases take ~30s each because the
-extension's scan path holds its NATS connection open at query end (the `duckdb`
-process only exits once that connection tears down). Against a local `NATS_URL`
-broker the same suite finishes in well under a second, so it is the fastest way
-to run the tests locally.
-
-
+Note: against the Docker broker the scan-mode cases take ~30s each because the extension's scan path holds its NATS
+connection open at query end (the `duckdb` process only exits once that connection tears down). Against a local
+`NATS_URL` broker the same suite finishes in well under a second, so it is the fastest way to run the tests locally.
 
 ## License
 
