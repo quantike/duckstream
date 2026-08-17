@@ -53,7 +53,6 @@ bar, and apply the subject filter server-side.
 | `start_time`    | TIMESTAMP | Start time (inclusive). Scan mode, or `start => 'by_start_time'`.                                       |
 | `end_time`      | TIMESTAMP | End time (inclusive). Scan mode.                                                                        |
 | `start`         | VARCHAR   | Starting point for a new consumer: `all` (default), `new`, `last`, `by_start_seq`, `by_start_time`. Honored only when the consumer is first created. Consumer modes. |
-| `ack`           | BOOLEAN   | Ack each message on emit, advancing the durable cursor (at-least-once). Default `false`. Durable mode. |
 | `batch`         | UBIGINT   | Messages requested per `fetch` while draining. Default `256`. Consumer modes.                          |
 | `max_messages`  | UBIGINT   | Hard cap on the number of rows returned. Consumer modes.                                               |
 | `json_extract`  | VARCHAR[] | JSON field paths, each mapped to a VARCHAR column.                                                      |
@@ -64,8 +63,10 @@ bar, and apply the subject filter server-side.
 | `ignore_errors` | BOOLEAN   | When `true`, payloads that fail to decode leave the affected columns NULL instead of failing the query. Default `false`. |
 
 `json_extract` and `proto_extract` cannot be used together. `proto_extract` requires both
-`proto_file` and `proto_message`. `durable` and `ephemeral` cannot be used together, and `ack`
-requires `durable`. `batch` and `max_messages` apply only to consumer modes.
+`proto_file` and `proto_message`. `durable` and `ephemeral` cannot be used together.
+`batch` and `max_messages` apply only to consumer modes. Durable consumers ack each message
+on emit, advancing the cursor (at-least-once: a cancelled query redelivers unacked messages
+on the next run).
 
 `format` sets the type of the whole `payload` column and is independent of the `json_extract`/`proto_*`
 projections (which add their own columns), so it composes with either. `format => 'json'` on a JSON
@@ -90,8 +91,8 @@ FROM read_jetstream('ORDERS', start_seq => 1, end_seq => 100, format => 'json');
 -- Ephemeral consumer: read everything currently in the stream (with a progress bar)
 SELECT count(*) FROM read_jetstream('ORDERS', ephemeral => true);
 
--- Durable consumer: each run reads only new messages and acks them
-SELECT * FROM read_jetstream('ORDERS', durable => 'nightly_etl', ack => true);
+-- Durable consumer: each run reads only new messages (acks are automatic)
+SELECT * FROM read_jetstream('ORDERS', durable => 'nightly_etl');
 
 -- Cap the drain and tune the fetch batch size
 SELECT * FROM read_jetstream('ORDERS', ephemeral => true, max_messages => 1000, batch => 500);
