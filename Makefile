@@ -1,4 +1,6 @@
-.PHONY: clean clean_all fmt lint check release-tag
+# Every target here is a task, not a file. Some (test, clean, configure) share a
+# name with a directory in the tree, so .PHONY is required, not cosmetic.
+.PHONY: all configure debug release test test_debug clean release-tag
 
 PROJ_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 
@@ -9,11 +11,15 @@ EXTENSION_NAME=duckstream
 # there is no forward compatibility across DuckDB releases.
 USE_UNSTABLE_C_API=1
 
-# Target DuckDB version. Must match the DuckDB version encoded by the duckdb
-# crate (see Cargo.toml). The extension-ci-tools submodule tracks the codenamed
-# branch that supports this version (v1.5-variegata for DuckDB v1.5.x); keep it
-# in step with ci_tools_version in .github/workflows/MainDistributionPipeline.yml.
-TARGET_DUCKDB_VERSION=v1.5.4
+# Target DuckDB version. The duckdb-rs crate pin in Cargo.toml (~1.10505.0)
+# encodes this (1.1MMPP.R -> v1.MINOR.PATCH) and is the real build target.
+# When bumping, keep these in sync by hand:
+#   - Cargo.toml           duckdb pin              (~1.1MMPP.0)
+#   - this file            TARGET_DUCKDB_VERSION   (v1.MINOR.PATCH)
+#   - .github/workflows/   MainDistributionPipeline.yml duckdb_version
+#   - .github/workflows/   integration.yml DUCKDB_VERSION (CLI for tests)
+#   - extension-ci-tools   submodule branch (vX.Y-codename; only on minor bumps)
+TARGET_DUCKDB_VERSION=v1.5.5
 
 all: configure debug
 
@@ -28,20 +34,8 @@ release: build_extension_library_release build_extension_with_metadata_release
 
 test: test_debug
 test_debug: test_extension_debug
-test_release: test_extension_release
 
 clean: clean_build clean_rust
-clean_all: clean_configure clean
-
-fmt: ## Format all Rust sources
-	cargo fmt --all
-
-lint: ## Check formatting and run clippy with warnings denied
-	cargo fmt --all -- --check
-	cargo clippy --all-targets -- -D warnings
-
-check: lint ## Run lint + unit tests (fast pre-commit gate; no extension build)
-	cargo test --lib
 
 # Read the crate version from Cargo.toml (single source of truth), tag it, and
 # push. The Release workflow (triggered by the v* tag) verifies the tag matches
