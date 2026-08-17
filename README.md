@@ -6,7 +6,7 @@
 A DuckDB extension for querying [NATS JetStream](https://docs.nats.io/nats-concepts/jetstream) with SQL.
 
 Written in Rust on top of DuckDB's [C Extension API](https://duckdb.org/docs/stable/clients/c/overview),
-targeting DuckDB v1.5.4.
+targeting DuckDB v1.5.5.
 
 ## Features
 
@@ -129,7 +129,7 @@ make debug       # cargo build, then append the .duckdb_extension footer
 The built extension is written to `build/debug/duckstream.duckdb_extension`. Use `make release` for
 an optimized build.
 
-The extension is built against a single DuckDB version (v1.5.4) because it uses DuckDB's unstable C
+The extension is built against a single DuckDB version (v1.5.5) because it uses DuckDB's unstable C
 API via `duckdb-rs`. The produced binary loads only into that exact DuckDB version.
 
 ### Loading
@@ -182,7 +182,7 @@ Requirements:
 
 - A built extension at `build/debug/duckstream.duckdb_extension`, or `DUCKSTREAM_EXT`
   pointing at one. If missing, the tests skip rather than fail.
-- A `duckdb` binary on `PATH` (or `DUCKDB_BIN`), matching the build version (v1.5.4).
+- A `duckdb` binary on `PATH` (or `DUCKDB_BIN`), matching the build version (v1.5.5).
 - A broker: either Docker (a `nats:2.10.14 --jetstream` container is started
   automatically), or set `NATS_URL` to reuse a local `nats-server -js`:
 

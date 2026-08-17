@@ -5,7 +5,7 @@
 #
 # The broker is provided by testcontainers (Docker is available on
 # ubuntu-latest). The duckdb CLI version must match the extension's build
-# target (v1.5.4), since a loadable extension pins to one DuckDB version.
+# target (v1.5.5), since a loadable extension pins to one DuckDB version.
 #
 name: Integration
 
@@ -21,7 +21,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  DUCKDB_VERSION: v1.5.4
+  DUCKDB_VERSION: v1.5.5
 
 jobs:
   integration:
