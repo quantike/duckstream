@@ -21,16 +21,16 @@ use crate::error::ScanError;
 /// `deliver_policy` is honored only at first creation). When `None`, an
 /// ephemeral consumer is created that is reaped shortly after the drain ends.
 ///
-/// `ack` selects the ack policy: `Explicit` (durable + ack-on-emit, so the
-/// cursor advances only as messages are acknowledged) or `None` (the server
-/// treats delivered messages as consumed without explicit acks).
+/// Ack policy is derived from the consumer kind: `Explicit` for durables (the
+/// cursor advances only as messages are acked on emit, so a cancelled query
+/// redelivers unacked messages on the next run) and `None` for ephemerals (no
+/// persistence, so acks are irrelevant).
 pub async fn create_consumer(
     url: &str,
     stream_name: &str,
     subject: Option<&str>,
     durable_name: Option<&str>,
     deliver_policy: jetstream::consumer::DeliverPolicy,
-    ack: bool,
 ) -> Result<(jetstream::consumer::PullConsumer, u64), ScanError> {
     use async_nats::jetstream::consumer::{pull, AckPolicy};
 
@@ -51,7 +51,7 @@ pub async fn create_consumer(
         })?;
 
     let is_durable = durable_name.is_some();
-    let ack_policy = if ack {
+    let ack_policy = if is_durable {
         AckPolicy::Explicit
     } else {
         AckPolicy::None

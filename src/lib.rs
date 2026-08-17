@@ -130,8 +130,6 @@ struct ConsumerSetup {
     runtime: Runtime,
     consumer: jetstream::consumer::PullConsumer,
     pending: u64,
-    /// Whether to ack each message on emit (durable + `ack => true`).
-    ack: bool,
     /// Messages requested per `fetch` (the `batch` parameter).
     batch: u64,
 }
@@ -224,10 +222,6 @@ enum Source {
         /// Messages requested per `fetch` request (the `batch` parameter),
         /// clamped each call to whatever is still `remaining`.
         batch: u64,
-        /// Ack each message on emit (durable + `ack => true`), advancing the
-        /// stored cursor. At-least-once: a query cancelled mid-drain leaves
-        /// un-acked messages for redelivery on the next run.
-        ack: bool,
     },
 }
 
@@ -390,10 +384,6 @@ impl VTab for ReadJetstream {
             .get_named_parameter("durable")
             .map(|v| v.to_string())
             .filter(|s| !s.is_empty());
-        let ack = bind
-            .get_named_parameter("ack")
-            .map(|v| v.to_bool())
-            .unwrap_or(false);
 
         // `batch` (fetch request size) and `max_messages` (hard row cap) only
         // apply to consumer modes; the scan path fetches one message per
@@ -407,9 +397,6 @@ impl VTab for ReadJetstream {
 
         if ephemeral && durable.is_some() {
             return Err(Box::new(ScanError::ModeConflict));
-        }
-        if ack && durable.is_none() {
-            return Err(Box::new(ScanError::AckRequiresDurable));
         }
         if batch.is_some() && !is_consumer {
             return Err(Box::new(ScanError::ConsumerOnlyParam { param: "batch" }));
@@ -458,7 +445,6 @@ impl VTab for ReadJetstream {
                 subject.as_deref(),
                 durable.as_deref(),
                 deliver_policy,
-                ack,
             ))?;
             // num_pending is a point-in-time snapshot taken when the consumer was
             // created, not a guarantee, so report it as an estimate (is_exact =
@@ -473,7 +459,6 @@ impl VTab for ReadJetstream {
                 runtime,
                 consumer,
                 pending,
-                ack,
                 batch,
             })
         } else {
@@ -527,7 +512,6 @@ impl VTab for ReadJetstream {
                     consumer: Box::new(setup.consumer),
                     remaining: setup.pending,
                     batch: setup.batch,
-                    ack: setup.ack,
                 },
             };
 
@@ -713,11 +697,9 @@ impl VTab for ReadJetstream {
                 consumer,
                 remaining,
                 batch,
-                ack,
             } => {
                 use futures_util::StreamExt;
 
-                let ack = *ack;
                 let want = fetch_want(*remaining, *batch, VECTOR_SIZE);
                 if want > 0 {
                     // PERF: one `fetch` request per func call (per output vector).
@@ -748,9 +730,7 @@ impl VTab for ReadJetstream {
                                     // still counts the message as consumed. A crash
                                     // between fetch and ack (or an ignored ack error)
                                     // just redelivers on the next run.
-                                    if ack {
-                                        let _ = msg.ack().await;
-                                    }
+                                    let _ = msg.ack().await;
                                     out.push(Row::new(
                                         msg.message.subject.clone(),
                                         seq,
@@ -919,7 +899,6 @@ impl VTab for ReadJetstream {
             ("start_time".to_string(), timestamp()),
             ("end_time".to_string(), timestamp()),
             ("start".to_string(), varchar()),
-            ("ack".to_string(), boolean()),
             ("batch".to_string(), ubigint()),
             ("max_messages".to_string(), ubigint()),
             ("json_extract".to_string(), varchar_list()),

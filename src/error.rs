@@ -68,8 +68,6 @@ pub enum ScanError {
     ProtoNoFields,
     #[error("durable and ephemeral consumer modes are mutually exclusive")]
     ModeConflict,
-    #[error("ack requires durable mode (ack => true only applies to durable consumers)")]
-    AckRequiresDurable,
     #[error("{param} requires a consumer mode (set ephemeral => true or durable => 'name')")]
     ConsumerOnlyParam { param: &'static str },
     #[error("batch must be greater than zero")]

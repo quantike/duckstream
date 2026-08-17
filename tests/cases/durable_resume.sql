@@ -4,7 +4,6 @@ SELECT seq, subject, payload::VARCHAR AS payload
 FROM read_jetstream(
     '${STREAM}',
     url     => '${NATS_URL}',
-    durable => 'it_resume',
-    ack     => true
+    durable => 'it_resume'
 )
 ORDER BY seq;
