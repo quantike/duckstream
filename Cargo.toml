@@ -1,6 +1,6 @@
 [package]
 name = "duckstream"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "A DuckDB extension for querying NATS JetStream, including live/tail streaming"
 license = "MIT"
