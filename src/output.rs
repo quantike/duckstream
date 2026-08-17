@@ -2,15 +2,17 @@
 //! including the JSON and protobuf field-extraction that populates the extra
 //! columns.
 //!
-//! Base columns (stream, subject, seq, ts, payload) are written directly by
-//! `func`. This module holds the per-value helpers for the optional extracted
-//! columns: [`json_extract_string`] pulls a dot-path value out of a JSON
-//! document as text, and [`write_proto_value`] writes a decoded protobuf value
-//! into a typed flat vector.
+//! [`RowWriter`] bundles the per-`func`-call config and output vectors so
+//! `func`'s body stays a thin loop. The per-value helpers ([`json_extract_string`],
+//! [`write_proto_value`], [`write_utf8_payload`]) remain public for reuse.
 
 use duckdb::core::{FlatVector, Inserter};
+use prost_reflect::{DynamicMessage, MessageDescriptor};
 
-use crate::proto::ProtoValue;
+use crate::config::PayloadFormat;
+use crate::error::ScanError;
+use crate::proto::{self, ProtoField, ProtoValue};
+use crate::row::Row;
 
 /// Write an extracted protobuf value into a typed DuckDB flat vector at `row`.
 ///
@@ -31,6 +33,150 @@ pub fn write_proto_value(vec: &mut FlatVector, row: usize, value: ProtoValue) {
         ProtoValue::F64(v) => unsafe { vec.as_mut_slice::<f64>()[row] = v },
         ProtoValue::Text(s) => vec.insert(row, s.as_str()),
         ProtoValue::Bytes(b) => vec.insert(row, b.as_slice()),
+    }
+}
+
+/// Bundles the per-`func`-call config and output vectors so the row-writing
+/// loop in `func` is a thin `write_row` call per row.
+///
+/// Extra-column vectors follow the five base columns at index 5+. JSON and
+/// proto extraction are mutually exclusive, so both vector lists start at 5.
+pub struct RowWriter<'a> {
+    pub stream_name: &'a str,
+    pub format: PayloadFormat,
+    pub ignore_errors: bool,
+    pub json_fields: &'a [String],
+    pub proto_descriptor: Option<&'a MessageDescriptor>,
+    pub proto_fields: &'a [ProtoField],
+    pub base: BaseVectorsMut<'a>,
+    pub json_vecs: Vec<FlatVector<'a>>,
+    pub proto_vecs: Vec<FlatVector<'a>>,
+}
+
+/// Mutable handles to the base-column vectors (indices 0-4), written for
+/// every row. Split out so [`RowWriter`] borrows them distinctly from the
+/// extra-column vectors.
+pub struct BaseVectorsMut<'a> {
+    pub stream: FlatVector<'a>,
+    pub subject: FlatVector<'a>,
+    pub seq: FlatVector<'a>,
+    pub ts: FlatVector<'a>,
+    pub payload: FlatVector<'a>,
+}
+
+impl<'a> RowWriter<'a> {
+    /// Write one row into every output vector at index `n`. Returns
+    /// [`ScanError`] when a payload fails the configured decode and
+    /// `ignore_errors` is false.
+    pub fn write_row(&mut self, n: usize, row: &Row) -> Result<(), ScanError> {
+        self.base.stream.insert(n, self.stream_name);
+        self.base.subject.insert(n, row.subject.as_str());
+        // Safety: n < VECTOR_SIZE and the vectors are sized for
+        // STANDARD_VECTOR_SIZE; rows are written sequentially from 0.
+        unsafe {
+            self.base.seq.as_mut_slice::<u64>()[n] = row.seq;
+            self.base.ts.as_mut_slice::<i64>()[n] = row.ts_micros;
+        }
+
+        // Decoded once to drive the error check, the extracted columns, and the
+        // format => 'json' payload path.
+        let proto_decoded = if let Some(descriptor) = self.proto_descriptor {
+            // Same predicate drives both reactions: throw by default, skip
+            // under ignore_errors.
+            let decoded = proto::decode_message(descriptor, &row.payload);
+            let is_instance = decoded
+                .as_ref()
+                .is_some_and(|d| proto::is_message_instance(d, &row.payload));
+            if !self.ignore_errors && !is_instance {
+                return Err(ScanError::NonProtoPayload {
+                    stream: self.stream_name.to_string(),
+                    seq: row.seq,
+                    hint: non_proto_hint(&row.payload),
+                });
+            }
+            Some(decoded)
+        } else {
+            None
+        };
+
+        self.write_payload(n, row, &proto_decoded)?;
+
+        if !self.json_fields.is_empty() {
+            self.write_json_columns(n, row)?;
+        }
+
+        if let Some(decoded) = &proto_decoded {
+            self.write_proto_columns(n, decoded.as_ref());
+        }
+        Ok(())
+    }
+
+    fn write_payload(
+        &mut self,
+        n: usize,
+        row: &Row,
+        proto_decoded: &Option<Option<DynamicMessage>>,
+    ) -> Result<(), ScanError> {
+        let has_proto = self.proto_descriptor.is_some();
+        match (self.format, has_proto) {
+            (PayloadFormat::Blob, _) => self.base.payload.insert(n, row.payload.as_ref()),
+            (PayloadFormat::Text, _) => {
+                // Fail loudly on non-UTF-8 unless the caller opted into
+                // dropping undecodable payloads.
+                write_utf8_payload(&mut self.base.payload, n, &row.payload, self.ignore_errors)
+                    .map_err(|_| ScanError::NonUtf8Payload {
+                        stream: self.stream_name.to_string(),
+                        seq: row.seq,
+                    })?;
+            }
+            (PayloadFormat::Json, true) => {
+                let json = proto_decoded
+                    .as_ref()
+                    .and_then(|d| d.as_ref())
+                    .and_then(proto::message_to_json);
+                match json {
+                    Some(s) => self.base.payload.insert(n, s.as_str()),
+                    None => self.base.payload.set_null(n),
+                }
+            }
+            (PayloadFormat::Json, false) => {
+                // Emitted unparsed; DuckDB validates JSON at query time. Only
+                // non-UTF-8 is rejected here, mirroring format => 'text'.
+                write_utf8_payload(&mut self.base.payload, n, &row.payload, self.ignore_errors)
+                    .map_err(|_| ScanError::NonUtf8Payload {
+                        stream: self.stream_name.to_string(),
+                        seq: row.seq,
+                    })?;
+            }
+        }
+        Ok(())
+    }
+
+    fn write_json_columns(&mut self, n: usize, row: &Row) -> Result<(), ScanError> {
+        let doc: Option<serde_json::Value> = serde_json::from_slice(&row.payload).ok();
+        if doc.is_none() && !self.ignore_errors {
+            return Err(ScanError::NonJsonPayload {
+                stream: self.stream_name.to_string(),
+                seq: row.seq,
+                hint: non_json_hint(&row.payload),
+            });
+        }
+        for (i, path) in self.json_fields.iter().enumerate() {
+            match doc.as_ref().and_then(|d| json_extract_string(d, path)) {
+                Some(s) => self.json_vecs[i].insert(n, s.as_str()),
+                None => self.json_vecs[i].set_null(n),
+            }
+        }
+        Ok(())
+    }
+
+    fn write_proto_columns(&mut self, n: usize, decoded: Option<&DynamicMessage>) {
+        for (i, field) in self.proto_fields.iter().enumerate() {
+            let value = decoded
+                .map(|d| proto::extract_value(d, &field.path))
+                .unwrap_or(ProtoValue::Null);
+            write_proto_value(&mut self.proto_vecs[i], n, value);
+        }
     }
 }
 

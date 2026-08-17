@@ -1,15 +1,97 @@
 //! Async JetStream stream and consumer I/O for the bounded `read_jetstream` modes.
 //!
 //! This module owns the network-touching operations the scan and consumer
-//! paths need: creating a pull consumer ([`create_consumer`]) and resolving a
-//! wall-clock timestamp to a stream sequence ([`resolve_time_to_seq`]) via
-//! binary search, since JetStream offers no direct timestamp lookup. All
-//! functions are `async` and are driven from the synchronous `VTab` callbacks
-//! by the runtime owned in the init data.
+//! paths need: opening a Direct Get scan ([`open_scan`]), creating a pull
+//! consumer ([`create_consumer`]), and resolving a wall-clock timestamp to a
+//! stream sequence ([`resolve_time_to_seq`]) via binary search, since JetStream
+//! offers no direct timestamp lookup. All functions are `async` and are driven
+//! from the synchronous `VTab` callbacks by the runtime owned in the init data.
 
 use async_nats::jetstream;
 
 use crate::error::ScanError;
+
+/// The resolved inputs for a Direct Get scan: the client and stream handles
+/// plus the inclusive sequence window.
+///
+/// Returned by [`open_scan`] so the caller can assemble its `Source` and
+/// `done` flag without the resolution logic leaking into `init`.
+pub struct ScanSource {
+    pub client: async_nats::Client,
+    pub stream: jetstream::stream::Stream,
+    pub current_seq: u64,
+    pub end_seq: u64,
+}
+
+/// Connect to `url`, look up `stream`, and resolve the effective sequence
+/// window from the `start_seq`/`end_seq`/`start_time`/`end_time` bounds.
+///
+/// Resolving up front means a bad URL or unknown stream fails the query at
+/// init rather than mid-scan. The returned [`ScanSource`] carries the handles
+/// and the resolved window; the caller computes `done` from the window and the
+/// stream's last sequence.
+pub async fn open_scan(
+    url: &str,
+    stream_name: &str,
+    start_seq: Option<u64>,
+    end_seq: Option<u64>,
+    start_time_micros: Option<i64>,
+    end_time_micros: Option<i64>,
+) -> Result<ScanSource, ScanError> {
+    let client = async_nats::connect(url)
+        .await
+        .map_err(|source| ScanError::Connect {
+            url: url.to_string(),
+            source,
+        })?;
+    // Retain the client so teardown can drain it; `Context` clones it
+    // internally, so this keeps a handle without a second connect.
+    let context = jetstream::new(client.clone());
+
+    let stream = context
+        .get_stream(stream_name)
+        .await
+        .map_err(|e| ScanError::StreamInfo {
+            stream: stream_name.to_string(),
+            source: Box::new(e),
+        })?;
+    let info = stream.cached_info();
+    let first_sequence = info.state.first_sequence;
+    let last_sequence = info.state.last_sequence;
+
+    // Start from the stream's first sequence, then tighten by the explicit seq
+    // bound and/or the resolved time bound (whichever is more restrictive).
+    let mut current_seq = start_seq.unwrap_or(first_sequence).max(first_sequence);
+    let mut end_seq = end_seq.unwrap_or(last_sequence).min(last_sequence);
+
+    if let Some(start_micros) = start_time_micros {
+        let resolved =
+            resolve_time_to_seq(&stream, start_micros, first_sequence, last_sequence, true).await;
+        if let Some(seq) = resolved {
+            current_seq = current_seq.max(seq);
+        } else {
+            // No message at or after start_time: empty result.
+            end_seq = 0;
+        }
+    }
+
+    if let Some(end_micros) = end_time_micros {
+        let resolved =
+            resolve_time_to_seq(&stream, end_micros, first_sequence, last_sequence, false).await;
+        if let Some(seq) = resolved {
+            end_seq = end_seq.min(seq);
+        } else {
+            end_seq = 0;
+        }
+    }
+
+    Ok(ScanSource {
+        client,
+        stream,
+        current_seq,
+        end_seq,
+    })
+}
 
 /// Connect and create a pull consumer for a bounded drain, optionally filtered
 /// by subject server-side. Returns the consumer and its `num_pending` count at

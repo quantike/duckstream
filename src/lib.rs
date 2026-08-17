@@ -28,7 +28,7 @@
 use std::error::Error;
 use std::sync::Mutex;
 
-use duckdb::core::{DataChunkHandle, Inserter, LogicalTypeHandle, LogicalTypeId};
+use duckdb::core::{DataChunkHandle, LogicalTypeHandle, LogicalTypeId};
 use duckdb::vtab::{BindInfo, InitInfo, TableFunctionInfo, VTab};
 use duckdb::{duckdb_entrypoint_c_api, Connection, Result};
 
@@ -43,12 +43,8 @@ mod proto;
 mod row;
 mod stream;
 
-use config::{parse_timestamp_micros, subject_matches, PayloadFormat, StartSpec};
-use error::ScanError;
-use output::{
-    json_extract_string, non_json_hint, non_proto_hint, write_proto_value, write_utf8_payload,
-};
-use proto::{ProtoField, ProtoValue};
+use config::{subject_matches, PayloadFormat, StartSpec};
+use proto::ProtoField;
 use row::Row;
 
 /// DuckDB's standard vector size; `func` emits at most this many rows per call.
@@ -84,6 +80,205 @@ fn capped_pending(pending: u64, max_messages: Option<u64>) -> u64 {
 /// `max_messages`), the user-requested `batch` size, and DuckDB's vector size.
 fn fetch_want(remaining: u64, batch: u64, vector_size: usize) -> usize {
     remaining.min(batch).min(vector_size as u64) as usize
+}
+
+/// The DuckDB type for the `payload` column, given the requested `format` and
+/// whether JSON extraction adds extra columns.
+///
+/// With `format` unset, extracting JSON implies a text payload, so the default
+/// BLOB becomes VARCHAR rather than staying BLOB.
+fn payload_column_type(format: PayloadFormat, json_fields: &[String]) -> LogicalTypeHandle {
+    let varchar = || LogicalTypeHandle::from(LogicalTypeId::Varchar);
+    match format {
+        PayloadFormat::Blob if json_fields.is_empty() => {
+            LogicalTypeHandle::from(LogicalTypeId::Blob)
+        }
+        PayloadFormat::Blob | PayloadFormat::Text => varchar(),
+        PayloadFormat::Json => {
+            let mut t = varchar();
+            t.set_alias("JSON");
+            t
+        }
+    }
+}
+
+/// Declare every result column on `bind`: the five base columns, the payload
+/// column, and one extra column per JSON/proto extraction path. Extra columns
+/// are named by the verbatim field path, dots preserved (e.g. `order.id`), so
+/// callers quote them in SQL.
+fn declare_columns(bind: &BindInfo, p: &config::BindParams, proto_fields: &[ProtoField]) {
+    let varchar = || LogicalTypeHandle::from(LogicalTypeId::Varchar);
+    let ubigint = || LogicalTypeHandle::from(LogicalTypeId::UBigint);
+    let timestamp = || LogicalTypeHandle::from(LogicalTypeId::Timestamp);
+
+    bind.add_result_column("stream", varchar());
+    bind.add_result_column("subject", varchar());
+    bind.add_result_column("seq", ubigint());
+    bind.add_result_column("ts_nats", timestamp());
+    bind.add_result_column("payload", payload_column_type(p.format, &p.json_fields));
+
+    for field in &p.json_fields {
+        bind.add_result_column(field, varchar());
+    }
+    for field in proto_fields {
+        bind.add_result_column(&field.path, LogicalTypeHandle::from(field.column_type));
+    }
+}
+
+/// Build the pull consumer (and the runtime that owns it) for a consumer-mode
+/// read, and report its `num_pending` as the query cardinality.
+///
+/// `num_pending` is a point-in-time snapshot taken when the consumer was
+/// created, not a guarantee, so it is reported as an estimate. `max_messages`
+/// caps both the drain and the reported cardinality.
+fn create_consumer_setup(
+    bind: &BindInfo,
+    p: &config::BindParams,
+) -> Result<ConsumerSetup, Box<dyn Error>> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()?;
+
+    // Default to All: drain everything currently in the stream.
+    let deliver_policy = p
+        .start
+        .unwrap_or(StartSpec::All)
+        .into_policy(p.start_seq, p.start_time_micros)?;
+
+    let (consumer, pending) = runtime.block_on(stream::create_consumer(
+        &p.url,
+        &p.stream,
+        p.subject.as_deref(),
+        p.durable.as_deref(),
+        deliver_policy,
+    ))?;
+    let pending = capped_pending(pending, p.max_messages);
+    bind.set_cardinality(pending, false);
+    Ok(ConsumerSetup {
+        runtime,
+        consumer,
+        pending,
+        batch: p.batch,
+    })
+}
+
+/// Pull up to [`VECTOR_SIZE`] messages from the active source into a common
+/// `Vec<Row>`, advancing the source cursor and setting `state.done` when the
+/// source is exhausted.
+///
+/// A [`Row`] holds reference-counted `Bytes` for the subject and payload, so
+/// buffering clones no message bytes. The buffer decouples acquisition from
+/// column writing, which the tail path (an async channel drain) will need.
+fn acquire_rows(state: &mut ScanState, runtime: &Runtime) -> Vec<Row> {
+    let subject_filter = state.subject.clone();
+    let mut rows: Vec<Row> = Vec::with_capacity(VECTOR_SIZE);
+
+    match &mut state.source {
+        Source::Scan {
+            stream,
+            current_seq,
+            end_seq,
+            ..
+        } => {
+            while rows.len() < VECTOR_SIZE && *current_seq <= *end_seq {
+                let seq = *current_seq;
+                *current_seq = seq.saturating_add(1);
+
+                // Prefer Direct Get (replica-served); fall back to the
+                // leader-only raw API for streams without `allow_direct`. A
+                // missing sequence (deleted/purged) is skipped.
+                //
+                // PERF: one blocking network round-trip per message. On large
+                // ranges this is the dominant cost. A batched Direct Get
+                // (multi-message request) or a pull-consumer drain would cut
+                // the round-trips dramatically; the consumer path below
+                // already fetches in batches for this reason.
+                let fetched = runtime.block_on(async {
+                    match stream.direct_get(seq).await {
+                        Ok(msg) => Some(msg),
+                        Err(_) => stream.get_raw_message(seq).await.ok(),
+                    }
+                });
+                let Some(msg) = fetched else {
+                    continue;
+                };
+
+                // Scan filtering is client-side (no server consumer).
+                if let Some(filter) = &subject_filter {
+                    if !subject_matches(filter, msg.subject.as_str()) {
+                        continue;
+                    }
+                }
+
+                rows.push(Row::new(
+                    msg.subject,
+                    msg.sequence,
+                    (msg.time.unix_timestamp_nanos() / 1_000) as i64,
+                    msg.payload,
+                ));
+            }
+            if *current_seq > *end_seq {
+                state.done = true;
+            }
+        }
+        Source::Consumer {
+            consumer,
+            remaining,
+            batch,
+        } => {
+            use futures_util::StreamExt;
+
+            let want = fetch_want(*remaining, *batch, VECTOR_SIZE);
+            if want > 0 {
+                // PERF: one `fetch` request per func call (per output vector).
+                // Fine for bounded drains, but each request has round-trip
+                // latency; for very large streams a persistent pull
+                // subscription reused across func calls would amortize that.
+                let fetched: Vec<Row> = runtime.block_on(async {
+                    let mut out = Vec::with_capacity(want);
+                    // `fetch` uses no_wait: returns what is available now and
+                    // ends, so this drains without blocking indefinitely.
+                    if let Ok(mut msgs) = consumer.fetch().max_messages(want).messages().await {
+                        while let Some(Ok(msg)) = msgs.next().await {
+                            let (seq, ts_micros) = match msg.info() {
+                                Ok(info) => (
+                                    info.stream_sequence,
+                                    (info.published.unix_timestamp_nanos() / 1_000) as i64,
+                                ),
+                                Err(_) => (0, 0),
+                            };
+                            // At-least-once: acking before the row reaches
+                            // DuckDB means a query cancelled after this point
+                            // still counts the message as consumed. A crash
+                            // between fetch and ack (or an ignored ack error)
+                            // just redelivers on the next run.
+                            let _ = msg.ack().await;
+                            out.push(Row::new(
+                                msg.message.subject.clone(),
+                                seq,
+                                ts_micros,
+                                msg.message.payload.clone(),
+                            ));
+                        }
+                    }
+                    out
+                });
+
+                *remaining = remaining.saturating_sub(fetched.len() as u64);
+                rows = fetched;
+            }
+            // `fetch`'s no_wait returns only what is available now, so an
+            // empty batch ends the drain even if `remaining > 0`: the seed
+            // came from a point-in-time `num_pending` estimate, and a bounded
+            // drain does not wait for messages that arrive later.
+            if *remaining == 0 || rows.is_empty() {
+                state.done = true;
+            }
+        }
+    }
+
+    rows
 }
 
 /// Parsed configuration for a scan-mode `read_jetstream` call.
@@ -191,6 +386,25 @@ struct ScanState {
     done: bool,
 }
 
+impl ScanState {
+    /// Construct a `ScanState` from the bind data plus a resolved source and
+    /// the initial `done` flag. The shared config fields are copied from the
+    /// bind data so the lock on `init.inner` is the only state `func` needs.
+    fn from_bind(bind_data: &ReadJetstreamBindData, source: Source, done: bool) -> Self {
+        Self {
+            stream_name: bind_data.stream.clone(),
+            subject: bind_data.subject.clone(),
+            json_fields: bind_data.json_fields.clone(),
+            format: bind_data.format,
+            ignore_errors: bind_data.ignore_errors,
+            proto_descriptor: bind_data.proto_descriptor.clone(),
+            proto_fields: bind_data.proto_fields.clone(),
+            source,
+            done,
+        }
+    }
+}
+
 /// The source of messages for a read.
 ///
 /// This enum is the extension seam for new read modes: unbounded tail will add
@@ -233,253 +447,50 @@ impl VTab for ReadJetstream {
     type BindData = ReadJetstreamBindData;
 
     fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn Error>> {
-        let varchar = || LogicalTypeHandle::from(LogicalTypeId::Varchar);
-        let ubigint = || LogicalTypeHandle::from(LogicalTypeId::UBigint);
-        let timestamp = || LogicalTypeHandle::from(LogicalTypeId::Timestamp);
+        let p = config::BindParams::from_bind(bind)?;
 
-        let json_fields: Vec<String> = bind
-            .get_named_parameter("json_extract")
-            .and_then(|v| v.to_list())
-            .map(|items| items.iter().map(|v| v.to_string()).collect())
-            .unwrap_or_default();
-
-        let ignore_errors = bind
-            .get_named_parameter("ignore_errors")
-            .map(|v| v.to_bool())
-            .unwrap_or(false);
-
-        let proto_file = bind
-            .get_named_parameter("proto_file")
-            .map(|v| v.to_string());
-        let proto_message = bind
-            .get_named_parameter("proto_message")
-            .map(|v| v.to_string());
-        let proto_paths: Vec<String> = bind
-            .get_named_parameter("proto_extract")
-            .and_then(|v| v.to_list())
-            .map(|items| items.iter().map(|v| v.to_string()).collect())
-            .unwrap_or_default();
-
-        let format = bind
-            .get_named_parameter("format")
-            .map(|v| PayloadFormat::parse(&v.to_string()))
-            .transpose()?
-            .unwrap_or_default();
-
-        if !json_fields.is_empty() && !proto_paths.is_empty() {
-            return Err(Box::new(ScanError::DecodeConflict));
-        }
-        let using_proto =
-            !proto_paths.is_empty() || proto_file.is_some() || proto_message.is_some();
-        if using_proto {
-            match (proto_file.is_some(), proto_message.is_some()) {
-                (false, true) => {
-                    return Err(Box::new(ScanError::ProtoIncomplete {
-                        present: "proto_message",
-                        missing: "proto_file",
-                    }));
-                }
-                (true, false) => {
-                    return Err(Box::new(ScanError::ProtoIncomplete {
-                        present: "proto_file",
-                        missing: "proto_message",
-                    }));
-                }
-                (false, false) => {
-                    return Err(Box::new(ScanError::ProtoIncomplete {
-                        present: "proto_extract",
-                        missing: "proto_file and proto_message",
-                    }));
-                }
-                (true, true) => {}
-            }
-            // format => 'json' serializes the whole message, so it needs no named
-            // fields; proto_extract is otherwise required.
-            if proto_paths.is_empty() && format != PayloadFormat::Json {
-                return Err(Box::new(ScanError::ProtoNoFields));
-            }
-        }
-
-        let (proto_descriptor, proto_fields) = if using_proto {
-            let file = proto_file.as_deref().unwrap();
-            let message = proto_message.as_deref().unwrap();
+        let (proto_descriptor, proto_fields) = if p.using_proto() {
+            let file = p.proto_file.as_deref().unwrap();
+            let message = p.proto_message.as_deref().unwrap();
             let descriptor = proto::compile_proto(file, message)?;
-            let fields = proto_paths
+            let fields = p
+                .proto_paths
                 .iter()
-                .map(|p| proto::field_column(&descriptor, p))
+                .map(|path| proto::field_column(&descriptor, path))
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             (Some(descriptor), fields)
         } else {
             (None, Vec::new())
         };
 
-        bind.add_result_column("stream", varchar());
-        bind.add_result_column("subject", varchar());
-        bind.add_result_column("seq", ubigint());
-        bind.add_result_column("ts_nats", timestamp());
+        declare_columns(bind, &p, &proto_fields);
 
-        // With `format` unset, extracting JSON implies a text payload, so the
-        // default BLOB becomes VARCHAR rather than staying BLOB.
-        let payload_type = match format {
-            PayloadFormat::Blob if json_fields.is_empty() => {
-                LogicalTypeHandle::from(LogicalTypeId::Blob)
-            }
-            PayloadFormat::Blob => varchar(),
-            PayloadFormat::Text => varchar(),
-            PayloadFormat::Json => {
-                let mut t = varchar();
-                t.set_alias("JSON");
-                t
-            }
-        };
-        bind.add_result_column("payload", payload_type);
-
-        // Extra columns are named by the verbatim field path, dots preserved
-        // (e.g. `order.id`), so callers quote them in SQL.
-        for field in &json_fields {
-            bind.add_result_column(field, varchar());
-        }
-        for field in &proto_fields {
-            bind.add_result_column(&field.path, LogicalTypeHandle::from(field.column_type));
-        }
-
-        let stream = bind.get_parameter(0).to_string();
-
-        let url = bind
-            .get_named_parameter("url")
-            .map(|v| v.to_string())
-            .unwrap_or_else(|| DEFAULT_URL.to_string());
-
-        let subject = bind
-            .get_named_parameter("subject")
-            .map(|v| {
-                let s = v.to_string();
-                // Validate structural NATS subject rules up front (wildcards are
-                // allowed); fail fast rather than silently matching nothing.
-                if async_nats::Subject::from(s.clone()).is_valid() {
-                    Ok(s)
-                } else {
-                    Err(ScanError::InvalidSubject { value: s })
-                }
-            })
-            .transpose()?;
-        let start_seq = bind.get_named_parameter("start_seq").map(|v| v.to_uint64());
-        let end_seq = bind.get_named_parameter("end_seq").map(|v| v.to_uint64());
-        // TIMESTAMP values cannot be read via the primitive integer getters, so
-        // parse DuckDB's canonical string rendering into epoch microseconds.
-        let start_time_micros = bind
-            .get_named_parameter("start_time")
-            .map(|v| parse_timestamp_micros(&v.to_string()))
-            .transpose()?;
-        let end_time_micros = bind
-            .get_named_parameter("end_time")
-            .map(|v| parse_timestamp_micros(&v.to_string()))
-            .transpose()?;
-
-        let ephemeral = bind
-            .get_named_parameter("ephemeral")
-            .map(|v| v.to_bool())
-            .unwrap_or(false);
-        let durable = bind
-            .get_named_parameter("durable")
-            .map(|v| v.to_string())
-            .filter(|s| !s.is_empty());
-
-        // `batch` (fetch request size) and `max_messages` (hard row cap) only
-        // apply to consumer modes; the scan path fetches one message per
-        // Direct Get and reads the full requested range.
-        let batch = bind.get_named_parameter("batch").map(|v| v.to_uint64());
-        let max_messages = bind
-            .get_named_parameter("max_messages")
-            .map(|v| v.to_uint64());
-
-        let is_consumer = ephemeral || durable.is_some();
-
-        if ephemeral && durable.is_some() {
-            return Err(Box::new(ScanError::ModeConflict));
-        }
-        if batch.is_some() && !is_consumer {
-            return Err(Box::new(ScanError::ConsumerOnlyParam { param: "batch" }));
-        }
-        if max_messages.is_some() && !is_consumer {
-            return Err(Box::new(ScanError::ConsumerOnlyParam {
-                param: "max_messages",
-            }));
-        }
-        if batch == Some(0) {
-            return Err(Box::new(ScanError::ZeroBatch));
-        }
-        let batch = batch.unwrap_or(DEFAULT_BATCH);
-
-        // The `start` policy selects a consumer's starting point at creation.
-        // It only applies to consumer modes; `by_start_*` reuse start_seq/time.
-        let start = bind
-            .get_named_parameter("start")
-            .map(|v| StartSpec::parse(&v.to_string()))
-            .transpose()?;
-
-        // For consumer mode, create the consumer now (in bind) so we can report
-        // its `num_pending` as the query cardinality, driving DuckDB's progress
-        // bar. The consumer handle and the runtime that owns it are carried
-        // forward to init/func.
-        //
-        // Note: creating a durable consumer persists server-side state, and bind
-        // runs even for EXPLAIN, so `EXPLAIN SELECT ... durable => 'x'` will
-        // create the durable. This mirrors the ephemeral path (which likewise
-        // creates its consumer in bind) and is the pragmatic trade-off for
-        // cardinality reporting, since `set_cardinality` is bind-only.
-        let consumer_setup = if ephemeral || durable.is_some() {
-            let runtime = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(1)
-                .enable_all()
-                .build()?;
-
-            // Default to All: drain everything currently in the stream.
-            let deliver_policy = start
-                .unwrap_or(StartSpec::All)
-                .into_policy(start_seq, start_time_micros)?;
-
-            let (consumer, pending) = runtime.block_on(stream::create_consumer(
-                &url,
-                &stream,
-                subject.as_deref(),
-                durable.as_deref(),
-                deliver_policy,
-            ))?;
-            // num_pending is a point-in-time snapshot taken when the consumer was
-            // created, not a guarantee, so report it as an estimate (is_exact =
-            // false). This still drives the progress bar while avoiding an
-            // overconfident cardinality that could mislead join planning.
-            //
-            // `max_messages` caps the drain (and the reported cardinality): the
-            // read stops after at most that many rows even if more are pending.
-            let pending = capped_pending(pending, max_messages);
-            bind.set_cardinality(pending, false);
-            Some(ConsumerSetup {
-                runtime,
-                consumer,
-                pending,
-                batch,
-            })
+        // Creating a durable consumer persists server-side state, and bind runs
+        // even for EXPLAIN, so `EXPLAIN SELECT ... durable => 'x'` creates the
+        // durable. This mirrors the ephemeral path and is the pragmatic
+        // trade-off for cardinality reporting, since `set_cardinality` is
+        // bind-only.
+        let consumer_setup = if p.is_consumer() {
+            Some(create_consumer_setup(bind, &p)?)
         } else {
             None
         };
 
         Ok(ReadJetstreamBindData {
-            stream,
-            url,
-            subject,
-            start_seq,
-            end_seq,
-            start_time_micros,
-            end_time_micros,
-            json_fields,
-            format,
-            ignore_errors,
+            stream: p.stream,
+            url: p.url,
+            subject: p.subject,
+            start_seq: p.start_seq,
+            end_seq: p.end_seq,
+            start_time_micros: p.start_time_micros,
+            end_time_micros: p.end_time_micros,
+            json_fields: p.json_fields,
+            format: p.format,
+            ignore_errors: p.ignore_errors,
             proto_descriptor,
             proto_fields,
-            ephemeral,
-            durable,
+            ephemeral: p.ephemeral,
+            durable: p.durable,
             consumer_setup: Mutex::new(consumer_setup),
         })
     }
@@ -488,7 +499,7 @@ impl VTab for ReadJetstream {
         let bind_data = unsafe { &*info.get_bind_data::<ReadJetstreamBindData>() };
 
         // Consumer mode (ephemeral or durable): reuse the runtime + consumer
-        // created during bind.
+        // created during bind. Subject filtering is server-side for consumers.
         if bind_data.ephemeral || bind_data.durable.is_some() {
             let setup = bind_data
                 .consumer_setup
@@ -497,23 +508,16 @@ impl VTab for ReadJetstream {
                 .take()
                 .expect("consumer setup missing from bind data");
 
-            let state = ScanState {
-                stream_name: bind_data.stream.clone(),
-                // Subject filtering is server-side for consumers, so no
-                // client-side filter is applied during the drain.
-                subject: None,
-                json_fields: bind_data.json_fields.clone(),
-                format: bind_data.format,
-                ignore_errors: bind_data.ignore_errors,
-                proto_descriptor: bind_data.proto_descriptor.clone(),
-                proto_fields: bind_data.proto_fields.clone(),
-                done: setup.pending == 0,
-                source: Source::Consumer {
+            let mut state = ScanState::from_bind(
+                bind_data,
+                Source::Consumer {
                     consumer: Box::new(setup.consumer),
                     remaining: setup.pending,
                     batch: setup.batch,
                 },
-            };
+                setup.pending == 0,
+            );
+            state.subject = None;
 
             return Ok(ReadJetstreamInitData {
                 runtime: Some(setup.runtime),
@@ -527,92 +531,26 @@ impl VTab for ReadJetstream {
             .enable_all()
             .build()?;
 
-        // Resolve the effective sequence window up front so a bad URL or
-        // unknown stream fails the query at init rather than mid-scan.
-        let state =
-            runtime.block_on(async {
-                let client = async_nats::connect(&bind_data.url)
-                    .await
-                    .map_err(|source| ScanError::Connect {
-                        url: bind_data.url.clone(),
-                        source,
-                    })?;
-                // Retain the client so teardown can drain it; `Context` clones
-                // it internally, so this keeps a handle without a second connect.
-                let context = jetstream::new(client.clone());
+        let scan = runtime.block_on(stream::open_scan(
+            &bind_data.url,
+            &bind_data.stream,
+            bind_data.start_seq,
+            bind_data.end_seq,
+            bind_data.start_time_micros,
+            bind_data.end_time_micros,
+        ))?;
 
-                let stream = context.get_stream(&bind_data.stream).await.map_err(|e| {
-                    ScanError::StreamInfo {
-                        stream: bind_data.stream.clone(),
-                        source: Box::new(e),
-                    }
-                })?;
-                let info = stream.cached_info();
-                let first_sequence = info.state.first_sequence;
-                let last_sequence = info.state.last_sequence;
-
-                // Start from the stream's first sequence, then tighten by the
-                // explicit seq bound and/or the resolved time bound (whichever is
-                // more restrictive).
-                let mut current_seq = bind_data
-                    .start_seq
-                    .unwrap_or(first_sequence)
-                    .max(first_sequence);
-                let mut end_seq = bind_data
-                    .end_seq
-                    .unwrap_or(last_sequence)
-                    .min(last_sequence);
-
-                if let Some(start_micros) = bind_data.start_time_micros {
-                    let resolved = stream::resolve_time_to_seq(
-                        &stream,
-                        start_micros,
-                        first_sequence,
-                        last_sequence,
-                        true,
-                    )
-                    .await;
-                    if let Some(seq) = resolved {
-                        current_seq = current_seq.max(seq);
-                    } else {
-                        // No message at or after start_time: empty result.
-                        end_seq = 0;
-                    }
-                }
-
-                if let Some(end_micros) = bind_data.end_time_micros {
-                    let resolved = stream::resolve_time_to_seq(
-                        &stream,
-                        end_micros,
-                        first_sequence,
-                        last_sequence,
-                        false,
-                    )
-                    .await;
-                    if let Some(seq) = resolved {
-                        end_seq = end_seq.min(seq);
-                    } else {
-                        end_seq = 0;
-                    }
-                }
-
-                Ok::<_, ScanError>(ScanState {
-                    stream_name: bind_data.stream.clone(),
-                    subject: bind_data.subject.clone(),
-                    json_fields: bind_data.json_fields.clone(),
-                    format: bind_data.format,
-                    ignore_errors: bind_data.ignore_errors,
-                    proto_descriptor: bind_data.proto_descriptor.clone(),
-                    proto_fields: bind_data.proto_fields.clone(),
-                    done: last_sequence == 0 || end_seq == 0 || current_seq > end_seq,
-                    source: Source::Scan {
-                        client,
-                        stream: Box::new(stream),
-                        current_seq,
-                        end_seq,
-                    },
-                })
-            })?;
+        let done = scan.end_seq == 0 || scan.current_seq > scan.end_seq;
+        let state = ScanState::from_bind(
+            bind_data,
+            Source::Scan {
+                client: scan.client,
+                stream: Box::new(scan.stream),
+                current_seq: scan.current_seq,
+                end_seq: scan.end_seq,
+            },
+            done,
+        );
 
         Ok(ReadJetstreamInitData {
             runtime: Some(runtime),
@@ -632,128 +570,8 @@ impl VTab for ReadJetstream {
             return Ok(());
         }
 
-        // Reduce each source's messages to a common [`Row`] so the
-        // column-writing below is source-agnostic. A [`Row`] holds
-        // reference-counted `Bytes` for the subject and payload, so buffering
-        // clones no message bytes — only refcount bumps. The buffer also
-        // decouples acquisition from column writing, which the tail path (an
-        // async channel drain) will need.
-        let subject_filter = state.subject.clone();
-        let mut rows: Vec<Row> = Vec::with_capacity(VECTOR_SIZE);
-
-        match &mut state.source {
-            Source::Scan {
-                client: _,
-                stream,
-                current_seq,
-                end_seq,
-            } => {
-                while rows.len() < VECTOR_SIZE && *current_seq <= *end_seq {
-                    let seq = *current_seq;
-                    *current_seq = seq.saturating_add(1);
-
-                    // Prefer Direct Get (replica-served); fall back to the
-                    // leader-only raw API for streams without `allow_direct`. A
-                    // missing sequence (deleted/purged) is skipped.
-                    //
-                    // PERF: one blocking network round-trip per message. On large
-                    // ranges this is the dominant cost. A batched Direct Get
-                    // (multi-message request) or a pull-consumer drain would cut
-                    // the round-trips dramatically; the consumer path below
-                    // already fetches in batches for this reason.
-                    let fetched = init
-                        .runtime
-                        .as_ref()
-                        .expect("runtime present outside drop")
-                        .block_on(async {
-                            match stream.direct_get(seq).await {
-                                Ok(msg) => Some(msg),
-                                Err(_) => stream.get_raw_message(seq).await.ok(),
-                            }
-                        });
-                    let Some(msg) = fetched else {
-                        continue;
-                    };
-
-                    // Scan filtering is client-side (no server consumer).
-                    if let Some(filter) = &subject_filter {
-                        if !subject_matches(filter, msg.subject.as_str()) {
-                            continue;
-                        }
-                    }
-
-                    rows.push(Row::new(
-                        msg.subject,
-                        msg.sequence,
-                        (msg.time.unix_timestamp_nanos() / 1_000) as i64,
-                        msg.payload,
-                    ));
-                }
-                if *current_seq > *end_seq {
-                    state.done = true;
-                }
-            }
-            Source::Consumer {
-                consumer,
-                remaining,
-                batch,
-            } => {
-                use futures_util::StreamExt;
-
-                let want = fetch_want(*remaining, *batch, VECTOR_SIZE);
-                if want > 0 {
-                    // PERF: one `fetch` request per func call (per output vector).
-                    // Fine for bounded drains, but each request has round-trip
-                    // latency; for very large streams a persistent pull
-                    // subscription reused across func calls would amortize that.
-                    let fetched: Vec<Row> = init
-                        .runtime
-                        .as_ref()
-                        .expect("runtime present outside drop")
-                        .block_on(async {
-                            let mut out = Vec::with_capacity(want);
-                            // `fetch` uses no_wait: returns what is available now and
-                            // ends, so this drains without blocking indefinitely.
-                            if let Ok(mut msgs) =
-                                consumer.fetch().max_messages(want).messages().await
-                            {
-                                while let Some(Ok(msg)) = msgs.next().await {
-                                    let (seq, ts_micros) = match msg.info() {
-                                        Ok(info) => (
-                                            info.stream_sequence,
-                                            (info.published.unix_timestamp_nanos() / 1_000) as i64,
-                                        ),
-                                        Err(_) => (0, 0),
-                                    };
-                                    // At-least-once: acking before the row reaches
-                                    // DuckDB means a query cancelled after this point
-                                    // still counts the message as consumed. A crash
-                                    // between fetch and ack (or an ignored ack error)
-                                    // just redelivers on the next run.
-                                    let _ = msg.ack().await;
-                                    out.push(Row::new(
-                                        msg.message.subject.clone(),
-                                        seq,
-                                        ts_micros,
-                                        msg.message.payload.clone(),
-                                    ));
-                                }
-                            }
-                            out
-                        });
-
-                    *remaining = remaining.saturating_sub(fetched.len() as u64);
-                    rows = fetched;
-                }
-                // `fetch`'s no_wait returns only what is available now, so an
-                // empty batch ends the drain even if `remaining > 0`: the seed
-                // came from a point-in-time `num_pending` estimate, and a
-                // bounded drain does not wait for messages that arrive later.
-                if *remaining == 0 || rows.is_empty() {
-                    state.done = true;
-                }
-            }
-        }
+        let runtime = init.runtime.as_ref().expect("runtime present outside drop");
+        let rows = acquire_rows(&mut state, runtime);
 
         // PERF: these clones happen on every func call (once per output vector).
         // They exist to release the `state` mutex borrow before writing to the
@@ -766,112 +584,34 @@ impl VTab for ReadJetstream {
         let ignore_errors = state.ignore_errors;
         let proto_descriptor = state.proto_descriptor.clone();
         let proto_fields = state.proto_fields.clone();
+        drop(state);
 
-        let stream_vec = output.flat_vector(0);
-        let subject_vec = output.flat_vector(1);
-        let mut seq_vec = output.flat_vector(2);
-        let mut ts_vec = output.flat_vector(3);
-        let mut payload_vec = output.flat_vector(4);
-
-        // Extra columns follow the five base columns at index 5+. JSON and
-        // proto extraction are mutually exclusive, so both loops start at 5.
-        let mut json_vecs: Vec<_> = (0..json_fields.len())
-            .map(|i| output.flat_vector(5 + i))
-            .collect();
-        let mut proto_vecs: Vec<_> = (0..proto_fields.len())
-            .map(|i| output.flat_vector(5 + i))
-            .collect();
+        let mut writer = output::RowWriter {
+            stream_name: &stream_name,
+            format,
+            ignore_errors,
+            json_fields: &json_fields,
+            proto_descriptor: proto_descriptor.as_ref(),
+            proto_fields: &proto_fields,
+            base: output::BaseVectorsMut {
+                stream: output.flat_vector(0),
+                subject: output.flat_vector(1),
+                seq: output.flat_vector(2),
+                ts: output.flat_vector(3),
+                payload: output.flat_vector(4),
+            },
+            // Extra columns follow the five base columns at index 5+. JSON and
+            // proto extraction are mutually exclusive, so both start at 5.
+            json_vecs: (0..json_fields.len())
+                .map(|i| output.flat_vector(5 + i))
+                .collect(),
+            proto_vecs: (0..proto_fields.len())
+                .map(|i| output.flat_vector(5 + i))
+                .collect(),
+        };
 
         for (n, row) in rows.iter().enumerate() {
-            stream_vec.insert(n, stream_name.as_str());
-            subject_vec.insert(n, row.subject.as_str());
-            // Safety: n < VECTOR_SIZE and the vectors are sized for
-            // STANDARD_VECTOR_SIZE; rows are written sequentially from 0.
-            unsafe {
-                seq_vec.as_mut_slice::<u64>()[n] = row.seq;
-                ts_vec.as_mut_slice::<i64>()[n] = row.ts_micros;
-            }
-            // Decoded once here to drive the error check, the extracted
-            // columns, and the format => 'json' payload path.
-            let proto_decoded = if let Some(descriptor) = &proto_descriptor {
-                // Same predicate drives both reactions: throw by default, skip
-                // under ignore_errors.
-                let decoded = proto::decode_message(descriptor, &row.payload);
-                let is_instance = decoded
-                    .as_ref()
-                    .is_some_and(|d| proto::is_message_instance(d, &row.payload));
-                if !ignore_errors && !is_instance {
-                    return Err(Box::new(ScanError::NonProtoPayload {
-                        stream: stream_name.clone(),
-                        seq: row.seq,
-                        hint: non_proto_hint(&row.payload),
-                    }));
-                }
-                Some(decoded)
-            } else {
-                None
-            };
-
-            match (format, proto_descriptor.is_some()) {
-                (PayloadFormat::Blob, _) => payload_vec.insert(n, row.payload.as_ref()),
-                (PayloadFormat::Text, _) => {
-                    // Fail loudly on non-UTF-8 unless the caller opted into
-                    // dropping undecodable payloads.
-                    write_utf8_payload(&mut payload_vec, n, &row.payload, ignore_errors).map_err(
-                        |_| ScanError::NonUtf8Payload {
-                            stream: stream_name.clone(),
-                            seq: row.seq,
-                        },
-                    )?;
-                }
-                (PayloadFormat::Json, true) => {
-                    let json = proto_decoded
-                        .as_ref()
-                        .and_then(|d| d.as_ref())
-                        .and_then(proto::message_to_json);
-                    match json {
-                        Some(s) => payload_vec.insert(n, s.as_str()),
-                        None => payload_vec.set_null(n),
-                    }
-                }
-                (PayloadFormat::Json, false) => {
-                    // Emitted unparsed; DuckDB validates JSON at query time. Only
-                    // non-UTF-8 is rejected here, mirroring format => 'text'.
-                    write_utf8_payload(&mut payload_vec, n, &row.payload, ignore_errors).map_err(
-                        |_| ScanError::NonUtf8Payload {
-                            stream: stream_name.clone(),
-                            seq: row.seq,
-                        },
-                    )?;
-                }
-            };
-
-            if !json_fields.is_empty() {
-                let doc: Option<serde_json::Value> = serde_json::from_slice(&row.payload).ok();
-                if doc.is_none() && !ignore_errors {
-                    return Err(Box::new(ScanError::NonJsonPayload {
-                        stream: stream_name.clone(),
-                        seq: row.seq,
-                        hint: non_json_hint(&row.payload),
-                    }));
-                }
-                for (i, path) in json_fields.iter().enumerate() {
-                    match doc.as_ref().and_then(|d| json_extract_string(d, path)) {
-                        Some(s) => json_vecs[i].insert(n, s.as_str()),
-                        None => json_vecs[i].set_null(n),
-                    }
-                }
-            }
-
-            if let Some(decoded) = &proto_decoded {
-                for (i, field) in proto_fields.iter().enumerate() {
-                    let value = decoded
-                        .as_ref()
-                        .map(|d| proto::extract_value(d, &field.path))
-                        .unwrap_or(ProtoValue::Null);
-                    write_proto_value(&mut proto_vecs[i], n, value);
-                }
-            }
+            writer.write_row(n, row)?;
         }
 
         output.set_len(rows.len());
