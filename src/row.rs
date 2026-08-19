@@ -36,6 +36,9 @@ pub struct Row {
     /// Raw message payload. [`Bytes`] is reference-counted; cloning is O(1)
     /// and shares the underlying buffer.
     pub payload: Bytes,
+    /// Message headers serialized as a JSON string, or `None` when the message
+    /// had no headers (or only NATS system headers on the scan path).
+    pub headers: Option<String>,
 }
 
 impl Row {
@@ -47,7 +50,14 @@ impl Row {
             seq,
             ts_micros,
             payload,
+            headers: None,
         }
+    }
+
+    /// Attach serialized headers, or leave `None` for empty/system-only headers.
+    pub fn with_headers(mut self, headers: Option<String>) -> Self {
+        self.headers = headers;
+        self
     }
 }
 
@@ -80,5 +90,17 @@ mod tests {
         let _s: &str = &row.subject;
         let _b: &[u8] = &row.payload;
         assert_eq!(&row.payload[..], &[0u8, 1u8]);
+    }
+
+    #[test]
+    fn with_headers_attaches_or_clears() {
+        let row = Row::new(Subject::from("a.b"), 1, 0, Bytes::from_static(b"x"));
+        assert_eq!(row.headers, None);
+
+        let with = row.with_headers(Some(r#"{"X-Trace":"abc"}"#.to_string()));
+        assert_eq!(with.headers.as_deref(), Some(r#"{"X-Trace":"abc"}"#));
+
+        let without = with.with_headers(None);
+        assert_eq!(without.headers, None);
     }
 }
