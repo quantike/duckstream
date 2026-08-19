@@ -41,6 +41,7 @@ pub fn write_proto_value(vec: &mut FlatVector, row: usize, value: ProtoValue) {
 ///
 /// Extra-column vectors follow the five base columns at index 5+. JSON and
 /// proto extraction are mutually exclusive, so both vector lists start at 5.
+/// The `headers` column (when present) follows the extraction columns.
 pub struct RowWriter<'a> {
     pub stream_name: &'a str,
     pub format: PayloadFormat,
@@ -51,6 +52,7 @@ pub struct RowWriter<'a> {
     pub base: BaseVectorsMut<'a>,
     pub json_vecs: Vec<FlatVector<'a>>,
     pub proto_vecs: Vec<FlatVector<'a>>,
+    pub headers_vec: Option<FlatVector<'a>>,
 }
 
 /// Mutable handles to the base-column vectors (indices 0-4), written for
@@ -108,6 +110,8 @@ impl<'a> RowWriter<'a> {
         if let Some(decoded) = &proto_decoded {
             self.write_proto_columns(n, decoded.as_ref());
         }
+
+        self.write_headers(n, row);
         Ok(())
     }
 
@@ -176,6 +180,16 @@ impl<'a> RowWriter<'a> {
                 .map(|d| proto::extract_value(d, &field.path))
                 .unwrap_or(ProtoValue::Null);
             write_proto_value(&mut self.proto_vecs[i], n, value);
+        }
+    }
+
+    fn write_headers(&mut self, n: usize, row: &Row) {
+        let Some(vec) = self.headers_vec.as_mut() else {
+            return;
+        };
+        match row.headers.as_deref() {
+            Some(s) => vec.insert(n, s),
+            None => vec.set_null(n),
         }
     }
 }

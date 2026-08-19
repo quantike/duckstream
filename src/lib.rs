@@ -33,6 +33,7 @@ use duckdb::vtab::{BindInfo, InitInfo, TableFunctionInfo, VTab};
 use duckdb::{duckdb_entrypoint_c_api, Connection, Result};
 
 use async_nats::jetstream;
+use async_nats::HeaderMap;
 use prost_reflect::MessageDescriptor;
 use tokio::runtime::Runtime;
 
@@ -102,6 +103,22 @@ fn payload_column_type(format: PayloadFormat, json_fields: &[String]) -> Logical
     }
 }
 
+/// Serialize a [`HeaderMap`] to a JSON string, dropping NATS system headers
+/// (`Nats-*`) that the scan path's Direct Get response includes but the
+/// consumer path does not. Returns `None` when the map is empty after
+/// filtering, so both paths yield SQL NULL for headerless messages.
+fn serialize_headers(map: &HeaderMap) -> Option<String> {
+    let filtered: std::collections::HashMap<&str, &Vec<_>> = map
+        .iter()
+        .filter(|(name, _)| !AsRef::<str>::as_ref(name).starts_with("Nats-"))
+        .map(|(name, values)| (AsRef::<str>::as_ref(name), values))
+        .collect();
+    if filtered.is_empty() {
+        return None;
+    }
+    serde_json::to_string(&filtered).ok()
+}
+
 /// Declare every result column on `bind`: the five base columns, the payload
 /// column, and one extra column per JSON/proto extraction path. Extra columns
 /// are named by the verbatim field path, dots preserved (e.g. `order.id`), so
@@ -122,6 +139,14 @@ fn declare_columns(bind: &BindInfo, p: &config::BindParams, proto_fields: &[Prot
     }
     for field in proto_fields {
         bind.add_result_column(&field.path, LogicalTypeHandle::from(field.column_type));
+    }
+
+    // Appended last so the hardcoded extra-column base index (5) in `func`
+    // stays stable regardless of whether headers are enabled.
+    if p.headers {
+        let mut t = varchar();
+        t.set_alias("JSON");
+        bind.add_result_column("headers", t);
     }
 }
 
@@ -211,12 +236,15 @@ fn acquire_rows(state: &mut ScanState, runtime: &Runtime) -> Vec<Row> {
                     }
                 }
 
-                rows.push(Row::new(
-                    msg.subject,
-                    msg.sequence,
-                    (msg.time.unix_timestamp_nanos() / 1_000) as i64,
-                    msg.payload,
-                ));
+                rows.push(
+                    Row::new(
+                        msg.subject,
+                        msg.sequence,
+                        (msg.time.unix_timestamp_nanos() / 1_000) as i64,
+                        msg.payload,
+                    )
+                    .with_headers(serialize_headers(&msg.headers)),
+                );
             }
             if *current_seq > *end_seq {
                 state.done = true;
@@ -254,12 +282,17 @@ fn acquire_rows(state: &mut ScanState, runtime: &Runtime) -> Vec<Row> {
                             // between fetch and ack (or an ignored ack error)
                             // just redelivers on the next run.
                             let _ = msg.ack().await;
-                            out.push(Row::new(
-                                msg.message.subject.clone(),
-                                seq,
-                                ts_micros,
-                                msg.message.payload.clone(),
-                            ));
+                            out.push(
+                                Row::new(
+                                    msg.message.subject.clone(),
+                                    seq,
+                                    ts_micros,
+                                    msg.message.payload.clone(),
+                                )
+                                .with_headers(
+                                    msg.message.headers.as_ref().and_then(serialize_headers),
+                                ),
+                            );
                         }
                     }
                     out
@@ -316,6 +349,8 @@ struct ReadJetstreamBindData {
     /// Consumer + runtime created during bind (for cardinality), moved out by
     /// init. `Mutex<Option<_>>` because bind data is only borrowed as `&`.
     consumer_setup: Mutex<Option<ConsumerSetup>>,
+    /// When true, the `headers` column is declared and populated.
+    headers: bool,
 }
 
 /// A pull consumer (ephemeral or durable) and the runtime that owns it, created
@@ -382,6 +417,8 @@ struct ScanState {
     /// Compiled protobuf descriptor + resolved field paths, if using protobuf.
     proto_descriptor: Option<MessageDescriptor>,
     proto_fields: Vec<ProtoField>,
+    /// When true, emit a `headers` column with serialized message headers.
+    headers: bool,
     source: Source,
     done: bool,
 }
@@ -399,6 +436,7 @@ impl ScanState {
             ignore_errors: bind_data.ignore_errors,
             proto_descriptor: bind_data.proto_descriptor.clone(),
             proto_fields: bind_data.proto_fields.clone(),
+            headers: bind_data.headers,
             source,
             done,
         }
@@ -492,6 +530,7 @@ impl VTab for ReadJetstream {
             ephemeral: p.ephemeral,
             durable: p.durable,
             consumer_setup: Mutex::new(consumer_setup),
+            headers: p.headers,
         })
     }
 
@@ -584,7 +623,12 @@ impl VTab for ReadJetstream {
         let ignore_errors = state.ignore_errors;
         let proto_descriptor = state.proto_descriptor.clone();
         let proto_fields = state.proto_fields.clone();
+        let headers = state.headers;
         drop(state);
+
+        // JSON and proto extraction are mutually exclusive, so the headers
+        // column (when enabled) follows whichever list is present.
+        let extra_count = json_fields.len().max(proto_fields.len());
 
         let mut writer = output::RowWriter {
             stream_name: &stream_name,
@@ -608,6 +652,7 @@ impl VTab for ReadJetstream {
             proto_vecs: (0..proto_fields.len())
                 .map(|i| output.flat_vector(5 + i))
                 .collect(),
+            headers_vec: headers.then(|| output.flat_vector(5 + extra_count)),
         };
 
         for (n, row) in rows.iter().enumerate() {
@@ -647,6 +692,7 @@ impl VTab for ReadJetstream {
             ("proto_file".to_string(), varchar()),
             ("proto_message".to_string(), varchar()),
             ("proto_extract".to_string(), varchar_list()),
+            ("headers".to_string(), boolean()),
         ])
     }
 }
@@ -659,7 +705,8 @@ pub unsafe fn extension_entrypoint(con: Connection) -> Result<(), Box<dyn Error>
 
 #[cfg(test)]
 mod tests {
-    use super::{capped_pending, fetch_want, DEFAULT_BATCH};
+    use super::{capped_pending, fetch_want, serialize_headers, DEFAULT_BATCH};
+    use async_nats::{header, HeaderMap};
 
     #[test]
     fn max_messages_caps_pending() {
@@ -686,5 +733,43 @@ mod tests {
         assert_eq!(fetch_want(0, DEFAULT_BATCH, 2048), 0);
         // A batch of one requests a single message at a time.
         assert_eq!(fetch_want(1000, 1, 2048), 1);
+    }
+
+    #[test]
+    fn serialize_headers_filters_nats_system_headers() {
+        let mut map = HeaderMap::new();
+        map.insert("Content-Type", "application/json");
+        map.insert(header::NATS_SUBJECT, "orders.us.1");
+        map.insert(header::NATS_SEQUENCE, "1");
+        let json = serialize_headers(&map).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let obj = parsed.as_object().unwrap();
+        assert_eq!(obj.len(), 1);
+        assert!(obj.contains_key("Content-Type"));
+        // No Nats-* keys survive filtering.
+        assert!(!json.contains("Nats-"));
+    }
+
+    #[test]
+    fn serialize_headers_none_for_empty_map() {
+        assert_eq!(serialize_headers(&HeaderMap::new()), None);
+    }
+
+    #[test]
+    fn serialize_headers_none_when_only_system_headers() {
+        let mut map = HeaderMap::new();
+        map.insert(header::NATS_SUBJECT, "orders.us.1");
+        map.insert(header::NATS_SEQUENCE, "1");
+        map.insert(header::NATS_TIME_STAMP, "2026-01-01T00:00:00Z");
+        assert_eq!(serialize_headers(&map), None);
+    }
+
+    #[test]
+    fn serialize_headers_multi_value_as_array() {
+        let mut map = HeaderMap::new();
+        map.insert("X-Trace-Id", "abc");
+        map.append("X-Trace-Id", "def");
+        let json = serialize_headers(&map).unwrap();
+        assert_eq!(json, r#"{"X-Trace-Id":["abc","def"]}"#);
     }
 }

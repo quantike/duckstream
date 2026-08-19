@@ -177,6 +177,9 @@ pub struct BindParams {
     pub batch: u64,
     pub max_messages: Option<u64>,
     pub start: Option<StartSpec>,
+    /// When true, emit a `headers` column (VARCHAR aliased JSON) with
+    /// message headers serialized as a JSON object.
+    pub headers: bool,
 }
 
 impl BindParams {
@@ -306,6 +309,11 @@ impl BindParams {
             .map(|v| StartSpec::parse(&v.to_string()))
             .transpose()?;
 
+        let headers = bind
+            .get_named_parameter("headers")
+            .map(|v| v.to_bool())
+            .unwrap_or(false);
+
         Ok(Self {
             stream,
             url,
@@ -325,6 +333,7 @@ impl BindParams {
             batch: batch_param.unwrap_or(super::DEFAULT_BATCH),
             max_messages,
             start,
+            headers,
         })
     }
 

@@ -56,6 +56,27 @@ fn format_json() {
         .run();
 }
 
+/// `headers => true` surfaces message headers as a JSON column. Messages
+/// without headers yield NULL. The JSON alias lets `->`/`->>` navigate values.
+#[test]
+fn message_headers() {
+    Case::new("message_headers")
+        .stream(&["orders.>"])
+        .publish_with_headers(
+            "orders.us.1",
+            br#"{"id":1}"#,
+            vec![
+                (
+                    "Content-Type".to_string(),
+                    vec!["application/json".to_string()],
+                ),
+                ("X-Trace-Id".to_string(), vec!["abc".to_string()]),
+            ],
+        )
+        .publish("orders.us.2", br#"{"id":2}"#)
+        .run();
+}
+
 /// Durable consumer resume: the first run drains all seeded messages and acks
 /// them; new messages are then published; the second run sees only those.
 #[test]

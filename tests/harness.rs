@@ -84,6 +84,7 @@ fn duckdb_bin() -> String {
 struct Message {
     subject: String,
     payload: Vec<u8>,
+    headers: Option<Vec<(String, Vec<String>)>>,
 }
 
 /// One ordered step in a case's script.
@@ -131,6 +132,27 @@ impl Case {
         let msg = Message {
             subject: format!("{}.{subject}", self.prefix()),
             payload: payload.to_vec(),
+            headers: None,
+        };
+        match self.steps.last_mut() {
+            Some(Step::Publish(batch)) => batch.push(msg),
+            _ => self.steps.push(Step::Publish(vec![msg])),
+        }
+        self
+    }
+
+    /// Append a publish step with message headers. Each `(name, values)` pair
+    /// maps to a NATS header; multiple values produce a multi-valued header.
+    pub fn publish_with_headers(
+        mut self,
+        subject: &str,
+        payload: &[u8],
+        headers: Vec<(String, Vec<String>)>,
+    ) -> Self {
+        let msg = Message {
+            subject: format!("{}.{subject}", self.prefix()),
+            payload: payload.to_vec(),
+            headers: Some(headers),
         };
         match self.steps.last_mut() {
             Some(Step::Publish(batch)) => batch.push(msg),
@@ -246,12 +268,27 @@ fn create_stream(url: &str, stream: &str, subjects: &[String]) {
 fn publish(url: &str, messages: &[Message]) {
     seed_runtime().block_on(async {
         let client = connect_with_retry(url).await;
-        let js = async_nats::jetstream::new(client);
+        let js = async_nats::jetstream::new(client.clone());
         for m in messages {
-            let ack = js
-                .publish(m.subject.clone(), m.payload.clone().into())
-                .await
-                .expect("seed: publish");
+            let ack = if let Some(ref headers) = m.headers {
+                let mut h = async_nats::HeaderMap::new();
+                for (name, values) in headers {
+                    for (i, value) in values.iter().enumerate() {
+                        if i == 0 {
+                            h.insert(name.as_str(), value.as_str());
+                        } else {
+                            h.append(name.as_str(), value.as_str());
+                        }
+                    }
+                }
+                js.publish_with_headers(m.subject.clone(), h, m.payload.clone().into())
+                    .await
+                    .expect("seed: publish")
+            } else {
+                js.publish(m.subject.clone(), m.payload.clone().into())
+                    .await
+                    .expect("seed: publish")
+            };
             ack.await.expect("seed: publish ack");
         }
     });

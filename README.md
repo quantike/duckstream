@@ -24,7 +24,8 @@ DuckDB v1.5.5.
 ## SQL API
 
 The extension registers the `read_jetstream` table function. It returns five base columns (`stream`, `subject`, `seq`,
-`ts_nats`, `payload`) plus one extra column per extracted JSON or protobuf field.
+`ts_nats`, `payload`) plus one extra column per extracted JSON or protobuf field, and an optional `headers` column
+(when `headers => true`).
 
 ### `read_jetstream(stream, ...)`
 
@@ -59,6 +60,7 @@ subject filter server-side.
 | `proto_extract` | VARCHAR[] | Protobuf field paths, each mapped to a schema-typed column.                                                                                                                   |
 | `format`        | VARCHAR   | Type of the `payload` column: `blob` (default), `text`, or `json`. `json` emits VARCHAR aliased `JSON`, so the `json` extension operators (`->`, `->>`) apply without a cast. |
 | `ignore_errors` | BOOLEAN   | When `true`, payloads that fail to decode leave the affected columns NULL instead of failing the query. Default `false`.                                                      |
+| `headers`       | BOOLEAN   | `true` adds a `headers` column (VARCHAR aliased `JSON`) containing message headers serialized as a JSON object. Messages without headers yield NULL. NATS system headers (`Nats-*`) are filtered out. Default `false`. |
 
 `json_extract` and `proto_extract` cannot be used together. `proto_extract` requires both `proto_file` and
 `proto_message`. `durable` and `ephemeral` cannot be used together. `batch` and `max_messages` apply only to consumer
@@ -107,6 +109,12 @@ FROM read_jetstream('ORDERS',
 -- Emit the payload as JSON and navigate it in SQL with -> / ->>
 SELECT payload->>'$.customer.name' AS customer, payload->>'$.total' AS total
 FROM read_jetstream('ORDERS', format => 'json');
+
+-- Surface message headers as a JSON column (opt-in)
+SELECT
+    headers->'$.Content-Type'->>'$[0]' AS content_type,
+    headers->'$.X-Trace-Id'->>'$[0]'   AS trace_id
+FROM read_jetstream('ORDERS', headers => true);
 ```
 
 ## Building
