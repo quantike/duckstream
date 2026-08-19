@@ -197,6 +197,7 @@ fn create_consumer_setup(
 /// column writing, which the tail path (an async channel drain) will need.
 fn acquire_rows(state: &mut ScanState, runtime: &Runtime) -> Vec<Row> {
     let subject_filter = state.subject.clone();
+    let headers_enabled = state.headers;
     let mut rows: Vec<Row> = Vec::with_capacity(VECTOR_SIZE);
 
     match &mut state.source {
@@ -243,7 +244,11 @@ fn acquire_rows(state: &mut ScanState, runtime: &Runtime) -> Vec<Row> {
                         (msg.time.unix_timestamp_nanos() / 1_000) as i64,
                         msg.payload,
                     )
-                    .with_headers(serialize_headers(&msg.headers)),
+                    .with_headers(
+                        headers_enabled
+                            .then(|| serialize_headers(&msg.headers))
+                            .flatten(),
+                    ),
                 );
             }
             if *current_seq > *end_seq {
@@ -290,7 +295,10 @@ fn acquire_rows(state: &mut ScanState, runtime: &Runtime) -> Vec<Row> {
                                     msg.message.payload.clone(),
                                 )
                                 .with_headers(
-                                    msg.message.headers.as_ref().and_then(serialize_headers),
+                                    headers_enabled
+                                        .then_some(msg.message.headers.as_ref())
+                                        .flatten()
+                                        .and_then(serialize_headers),
                                 ),
                             );
                         }
