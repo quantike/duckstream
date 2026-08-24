@@ -111,9 +111,8 @@ fn discard_name(policy: jetstream::stream::DiscardPolicy) -> &'static str {
     }
 }
 
-/// Connect and drain the connection, returning the client's context. The drain
-/// runs on both the success and error paths: without it, dropping the runtime
-/// blocks on async-nats's background connection task.
+/// Connect to NATS and return the client plus a JetStream context on it. The
+/// caller drains the client before the owning runtime shuts down.
 async fn connect(url: &str) -> Result<(async_nats::Client, jetstream::Context), ScanError> {
     let client = async_nats::connect(url)
         .await
