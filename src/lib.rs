@@ -19,6 +19,7 @@
 //! - [`error`]: the [`ScanError`](error::ScanError) type shared across modes.
 //! - [`config`]: pure parameter parsing/validation ([`StartSpec`](config::StartSpec),
 //!   subject matching, timestamp parsing).
+//! - [`streams`]: the `jetstream_streams` table function (stream catalog).
 //! - [`stream`]: async JetStream stream/consumer I/O (consumer creation, time→sequence resolution).
 //! - [`row`]: the `Bytes`-backed [`Row`](row::Row) buffered between message
 //!   acquisition and column writing.
@@ -43,6 +44,7 @@ mod output;
 mod proto;
 mod row;
 mod stream;
+mod streams;
 
 use config::{subject_matches, PayloadFormat, StartSpec};
 use proto::ProtoField;
@@ -708,6 +710,7 @@ impl VTab for ReadJetstream {
 #[duckdb_entrypoint_c_api]
 pub unsafe fn extension_entrypoint(con: Connection) -> Result<(), Box<dyn Error>> {
     con.register_table_function::<ReadJetstream>("read_jetstream")?;
+    streams::register(&con)?;
     Ok(())
 }
 

@@ -91,3 +91,16 @@ fn durable_resume() {
         .query("durable_resume.sql", "durable_resume_second")
         .run_script();
 }
+
+/// `jetstream_streams` reports every stream's configuration and state, one row
+/// per stream, and supports exact single-stream selection. Timestamps vary per
+/// run and the shared broker holds other cases' streams, so the enumeration
+/// query selects only stable columns and filters to this case's stream.
+#[test]
+fn streams() {
+    Case::new("streams")
+        .stream(&["orders.>"])
+        .publish("orders.us.1", br#"{"id":1}"#)
+        .publish("orders.us.2", br#"{"id":2}"#)
+        .run();
+}

@@ -20,10 +20,13 @@ DuckDB v1.5.5.
 - Protocol Buffers extraction: supply a `.proto` schema at query time (compiled in pure Rust, no `protoc` binary
   required) and get columns whose types are derived from the schema (`UBIGINT`, `DOUBLE`, `BOOLEAN`, and so on),
   including nested-field descent.
+- Stream metadata: `jetstream_streams()` returns the configuration and live state of every stream (message counts,
+  sequence bounds, retention, limits), one row per stream, or a single stream via `stream =>`.
 
 ## SQL API
 
-The extension registers the `read_jetstream` table function. It returns five base columns (`stream`, `subject`, `seq`,
+The extension registers two table functions: `read_jetstream` (message reads) and `jetstream_streams` (stream
+catalog). It returns five base columns (`stream`, `subject`, `seq`,
 `ts_nats`, `payload`) plus one extra column per extracted JSON or protobuf field, and an optional `headers` column
 (when `headers => true`).
 
@@ -115,6 +118,48 @@ SELECT
     headers->'$.Content-Type'->>'$[0]' AS content_type,
     headers->'$.X-Trace-Id'->>'$[0]'   AS trace_id
 FROM read_jetstream('ORDERS', headers => true);
+```
+
+### `jetstream_streams()`
+
+The stream catalog, one row per stream. Called with no selector it enumerates every stream on the server; with
+`stream =>` it looks up one stream exactly (an unknown name fails the query with a 404-style error). A point-in-time
+snapshot taken at query start.
+
+| Column               | Type      | Description                                                            |
+| -------------------- | --------- | ---------------------------------------------------------------------- |
+| `stream`             | VARCHAR   | Stream name.                                                           |
+| `created`            | TIMESTAMP | When the stream was created.                                           |
+| `messages`           | UBIGINT   | Number of messages currently in the stream.                            |
+| `bytes`              | UBIGINT   | Total bytes of stored messages.                                        |
+| `first_seq`          | UBIGINT   | Lowest sequence still present.                                         |
+| `first_ts`           | TIMESTAMP | Timestamp of the oldest message.                                       |
+| `last_seq`           | UBIGINT   | Last sequence assigned.                                                |
+| `last_ts`            | TIMESTAMP | Timestamp of the newest message.                                       |
+| `consumer_count`     | UBIGINT   | Number of consumers on the stream.                                     |
+| `subjects_count`     | UBIGINT   | Number of distinct subjects.                                           |
+| `deleted_count`      | UBIGINT   | Deleted message count, or NULL when the server does not report one.     |
+| `retention`          | VARCHAR   | `limits`, `interest`, or `workqueue`.                                  |
+| `storage`            | VARCHAR   | `file` or `memory`.                                                    |
+| `discard`            | VARCHAR   | `old` or `new`.                                                        |
+| `max_messages`       | BIGINT    | Message limit; -1 means unlimited.                                     |
+| `max_bytes`          | BIGINT    | Byte limit; -1 means unlimited.                                        |
+| `max_message_size`   | BIGINT    | Largest accepted message; -1 means unlimited.                          |
+| `num_replicas`       | UINTEGER  | Replica count.                                                         |
+| `sealed`             | BOOLEAN   | Whether the stream is sealed.                                          |
+| `allow_direct`       | BOOLEAN   | Whether Direct Get is enabled.                                         |
+| `description`        | VARCHAR   | Stream description, or NULL.                                           |
+| `subjects`           | VARCHAR[] | Subject filters configured on the stream.                             |
+
+Parameters: `stream` (VARCHAR, optional, exact single-stream lookup) and `url` (VARCHAR, default
+`nats://localhost:4222`).
+
+```sql
+-- Every stream on the server
+SELECT stream, messages, last_seq FROM jetstream_streams() ORDER BY stream;
+
+-- One stream: check state and find the last sequence
+SELECT messages, last_seq, retention FROM jetstream_streams(stream => 'ORDERS');
 ```
 
 ## Building

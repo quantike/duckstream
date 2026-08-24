@@ -25,6 +25,11 @@ pub enum ScanError {
         #[source]
         source: Box<dyn Error + Send + Sync>,
     },
+    #[error("failed to list streams: {source}")]
+    StreamList {
+        #[source]
+        source: Box<dyn Error + Send + Sync>,
+    },
     #[error("failed to create consumer on stream '{stream}': {source}")]
     Consumer {
         stream: String,
