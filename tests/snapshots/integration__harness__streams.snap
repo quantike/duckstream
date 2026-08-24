@@ -1,0 +1,9 @@
+---
+source: tests/harness.rs
+assertion_line: 216
+expression: output
+---
+stream,messages,first_seq,last_seq,consumer_count,subjects_count,deleted_count,retention,storage,discard,num_replicas,sealed,allow_direct,description,subjects
+IT_STREAMS,2,1,2,0,2,NULL,limits,memory,old,1,false,false,NULL,[it_streams.orders.>]
+stream,messages,last_seq
+IT_STREAMS,2,2
