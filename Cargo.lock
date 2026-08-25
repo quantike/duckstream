@@ -877,6 +877,7 @@ dependencies = [
  "insta",
  "prost",
  "prost-reflect",
+ "prost-types",
  "protox",
  "serde_json",
  "testcontainers",

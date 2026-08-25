@@ -69,7 +69,9 @@ pub enum ScanError {
         /// The proto parameter that must also be supplied.
         missing: &'static str,
     },
-    #[error("proto_file/proto_message require a non-empty proto_extract list")]
+    #[error("proto_file and proto_descriptors are mutually exclusive (supply one schema source)")]
+    ProtoSourceConflict,
+    #[error("proto schema source and proto_message require a non-empty proto_extract list")]
     ProtoNoFields,
     #[error("durable and ephemeral consumer modes are mutually exclusive")]
     ModeConflict,

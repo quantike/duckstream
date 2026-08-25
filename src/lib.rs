@@ -345,8 +345,8 @@ struct ReadJetstreamBindData {
     /// When true, undecodable payloads leave extracted columns NULL instead of
     /// failing the query.
     ignore_errors: bool,
-    /// Compiled protobuf message descriptor, if `proto_file`/`proto_message`
-    /// were provided.
+    /// Compiled protobuf message descriptor, if a proto schema source and
+    /// `proto_message` were provided.
     proto_descriptor: Option<MessageDescriptor>,
     /// Resolved protobuf field paths + their DuckDB column types.
     proto_fields: Vec<ProtoField>,
@@ -498,9 +498,14 @@ impl VTab for ReadJetstream {
         let p = config::BindParams::from_bind(bind)?;
 
         let (proto_descriptor, proto_fields) = if p.using_proto() {
-            let file = p.proto_file.as_deref().unwrap();
             let message = p.proto_message.as_deref().unwrap();
-            let descriptor = proto::compile_proto(file, message)?;
+            let descriptor = match (p.proto_file.as_deref(), p.proto_descriptors.as_deref()) {
+                (Some(file), None) => proto::compile_proto(file, message)?,
+                (None, Some(file)) => proto::load_descriptors(file, message)?,
+                // from_bind rejects the both case (ProtoSourceConflict) and
+                // proto_incomplete rejects the neither case.
+                _ => unreachable!("proto schema source conflict passed validation"),
+            };
             let fields = p
                 .proto_paths
                 .iter()
@@ -700,6 +705,7 @@ impl VTab for ReadJetstream {
             ("format".to_string(), varchar()),
             ("ignore_errors".to_string(), boolean()),
             ("proto_file".to_string(), varchar()),
+            ("proto_descriptors".to_string(), varchar()),
             ("proto_message".to_string(), varchar()),
             ("proto_extract".to_string(), varchar_list()),
             ("headers".to_string(), boolean()),

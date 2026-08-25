@@ -257,8 +257,8 @@ pub fn json_extract_string(doc: &serde_json::Value, path: &str) -> Option<String
 /// exact bytes worth flagging.
 pub fn non_json_hint(payload: &[u8]) -> String {
     if payload.first().is_some_and(|&b| b < 0x20) {
-        ": the payload looks binary (e.g. protobuf); use proto_file, \
-         proto_message, and proto_extract instead of json_extract"
+        ": the payload looks binary (e.g. protobuf); use proto_file or \
+         proto_descriptors, proto_message, and proto_extract instead of json_extract"
             .to_string()
     } else {
         String::new()
@@ -273,8 +273,8 @@ pub fn non_json_hint(payload: &[u8]) -> String {
 pub fn non_proto_hint(payload: &[u8]) -> String {
     let opens_json = matches!(lead_byte(payload), Some(b'{') | Some(b'['));
     if opens_json {
-        ": the payload looks like JSON; use json_extract instead of proto_file, \
-         proto_message, and proto_extract"
+        ": the payload looks like JSON; use json_extract instead of proto_file or \
+         proto_descriptors, proto_message, and proto_extract"
             .to_string()
     } else {
         String::new()

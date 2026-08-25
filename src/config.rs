@@ -170,6 +170,7 @@ pub struct BindParams {
     pub format: PayloadFormat,
     pub ignore_errors: bool,
     pub proto_file: Option<String>,
+    pub proto_descriptors: Option<String>,
     pub proto_message: Option<String>,
     pub proto_paths: Vec<String>,
     pub ephemeral: bool,
@@ -184,9 +185,13 @@ pub struct BindParams {
 
 impl BindParams {
     /// True when the call uses the protobuf decode path (any proto_ parameter
-    /// supplied). When true, `proto_file` and `proto_message` must both be set.
+    /// supplied). When true, a schema source (`proto_file` or
+    /// `proto_descriptors`) and `proto_message` must both be set.
     pub fn using_proto(&self) -> bool {
-        !self.proto_paths.is_empty() || self.proto_file.is_some() || self.proto_message.is_some()
+        !self.proto_paths.is_empty()
+            || self.proto_file.is_some()
+            || self.proto_descriptors.is_some()
+            || self.proto_message.is_some()
     }
 
     /// True when the call uses a JetStream consumer (ephemeral or durable)
@@ -212,6 +217,9 @@ impl BindParams {
         let proto_file = bind
             .get_named_parameter("proto_file")
             .map(|v| v.to_string());
+        let proto_descriptors = bind
+            .get_named_parameter("proto_descriptors")
+            .map(|v| v.to_string());
         let proto_message = bind
             .get_named_parameter("proto_message")
             .map(|v| v.to_string());
@@ -230,8 +238,11 @@ impl BindParams {
         if !json_fields.is_empty() && !proto_paths.is_empty() {
             return Err(ScanError::DecodeConflict);
         }
+        if proto_file.is_some() && proto_descriptors.is_some() {
+            return Err(ScanError::ProtoSourceConflict);
+        }
         if Self::proto_incomplete(
-            proto_file.is_some(),
+            proto_file.is_some() || proto_descriptors.is_some(),
             proto_message.is_some(),
             !proto_paths.is_empty(),
         )? {
@@ -326,6 +337,7 @@ impl BindParams {
             format,
             ignore_errors,
             proto_file,
+            proto_descriptors,
             proto_message,
             proto_paths,
             ephemeral,
@@ -337,30 +349,30 @@ impl BindParams {
         })
     }
 
-    /// Validate the proto_file/proto_message/proto_extract triple, returning
-    /// `Ok(true)` when the protobuf path is in use, `Ok(false)` when it is not,
-    /// and `Err` for any incomplete combination.
+    /// Validate the proto schema source / proto_message / proto_extract
+    /// combination, returning `Ok(true)` when the protobuf path is in use,
+    /// `Ok(false)` when it is not, and `Err` for any incomplete combination.
     fn proto_incomplete(
-        has_file: bool,
+        has_source: bool,
         has_message: bool,
         has_paths: bool,
     ) -> Result<bool, ScanError> {
-        let using = has_file || has_message || has_paths;
+        let using = has_source || has_message || has_paths;
         if !using {
             return Ok(false);
         }
-        match (has_file, has_message) {
+        match (has_source, has_message) {
             (false, true) => Err(ScanError::ProtoIncomplete {
                 present: "proto_message",
-                missing: "proto_file",
+                missing: "proto_file or proto_descriptors",
             }),
             (true, false) => Err(ScanError::ProtoIncomplete {
-                present: "proto_file",
+                present: "proto_file or proto_descriptors",
                 missing: "proto_message",
             }),
             (false, false) => Err(ScanError::ProtoIncomplete {
                 present: "proto_extract",
-                missing: "proto_file and proto_message",
+                missing: "a proto schema source and proto_message",
             }),
             (true, true) => Ok(true),
         }

@@ -1,0 +1,9 @@
+syntax = "proto3";
+
+package shop;
+
+message Order {
+    uint64 id = 1;
+    double total = 2;
+    string status = 3;
+}
