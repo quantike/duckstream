@@ -1,0 +1,7 @@
+---
+source: tests/harness.rs
+expression: output
+---
+seq,id,total,status
+1,1,10.5,new
+2,2,20.0,shipped

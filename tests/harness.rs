@@ -19,6 +19,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::OnceLock;
 
+use prost::Message as _;
 use testcontainers_modules::nats::{Nats, NatsServerCmd};
 use testcontainers_modules::testcontainers::runners::SyncRunner;
 use testcontainers_modules::testcontainers::{Container, ImageExt};
@@ -85,6 +86,15 @@ struct Message {
     subject: String,
     payload: Vec<u8>,
     headers: Option<Vec<(String, Vec<String>)>>,
+}
+
+/// A scalar field value for [`Case::publish_proto`]. Covers the field kinds
+/// the committed `.proto` fixtures use; add variants as new fixtures need
+/// them.
+pub enum ProtoFieldValue {
+    U64(u64),
+    F64(f64),
+    Text(&'static str),
 }
 
 /// One ordered step in a case's script.
@@ -159,6 +169,37 @@ impl Case {
             _ => self.steps.push(Step::Publish(vec![msg])),
         }
         self
+    }
+
+    /// Append a publish step whose payload is a protobuf message built from the
+    /// case's committed schema.
+    ///
+    /// Compiles `tests/cases/<case>.proto` with `protox`, sets each
+    /// `(field, value)` pair on a [`prost_reflect::DynamicMessage`], and
+    /// encodes it. The fixture derives from the schema file, so editing the
+    /// `.proto` without updating the values fails here rather than producing
+    /// stale bytes.
+    pub fn publish_proto(
+        self,
+        subject: &str,
+        message: &str,
+        fields: &[(&str, ProtoFieldValue)],
+    ) -> Self {
+        let pool = compile_case_pool(&self.name);
+        let descriptor = pool
+            .get_message_by_name(message)
+            .unwrap_or_else(|| panic!("message '{message}' not found in {}.proto", self.name));
+
+        let mut msg = prost_reflect::DynamicMessage::new(descriptor);
+        for (name, value) in fields {
+            let value = match value {
+                ProtoFieldValue::U64(v) => prost_reflect::Value::U64(*v),
+                ProtoFieldValue::F64(v) => prost_reflect::Value::F64(*v),
+                ProtoFieldValue::Text(s) => prost_reflect::Value::String((*s).to_string()),
+            };
+            msg.set_field_by_name(name, value);
+        }
+        self.publish(subject, &msg.encode_to_vec())
     }
 
     /// Append a query step: run `tests/cases/<sql_file>` and snapshot it under
@@ -294,20 +335,65 @@ fn publish(url: &str, messages: &[Message]) {
     });
 }
 
-/// Read a committed `.sql` file and substitute `${NATS_URL}`, `${STREAM}`, and
-/// `${SUBJECT_PREFIX}`.
+/// Read a committed `.sql` file and substitute `${NATS_URL}`, `${STREAM}`,
+/// `${SUBJECT_PREFIX}`, and `${DESCRIPTORS}`.
+///
+/// `${DESCRIPTORS}` expands to a temp file holding the `FileDescriptorSet`
+/// compiled from the case's `tests/cases/<name>.proto` (the artifact form
+/// `buf build -o` produces). The path is stable per test binary, so parallel
+/// harness runs cannot race: a concurrent writer truncates and rewrites
+/// identical bytes.
 ///
 /// The placeholders keep the files runnable by hand: export the same env and
-/// the SQL still reads naturally.
+/// the SQL still reads naturally. `${DESCRIPTORS}` is the exception; it must
+/// point at a pre-built `FileDescriptorSet`, which the harness compiles from
+/// the case's `.proto` here.
 fn load_sql(file: &str, url: &str, stream: &str, prefix: &str) -> String {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/cases")
-        .join(file);
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let path = root.join("tests/cases").join(file);
     let raw =
         std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-    raw.replace("${NATS_URL}", url)
+    let descriptors = raw
+        .contains("${DESCRIPTORS}")
+        .then(|| compile_case_descriptors(&root, file.strip_suffix(".sql").unwrap_or(file)));
+    let mut sql = raw
+        .replace("${NATS_URL}", url)
         .replace("${STREAM}", stream)
-        .replace("${SUBJECT_PREFIX}", prefix)
+        .replace("${SUBJECT_PREFIX}", prefix);
+    if let Some(path) = descriptors {
+        sql = sql.replace("${DESCRIPTORS}", &path.display().to_string());
+    }
+    sql
+}
+
+/// Compile `tests/cases/<case>.proto` into a `FileDescriptorSet` under the
+/// temp dir and return its path.
+fn compile_case_descriptors(root: &std::path::Path, case: &str) -> PathBuf {
+    let proto = root.join("tests/cases").join(format!("{case}.proto"));
+    let fds = compile_proto_file(&proto);
+    let path = std::env::temp_dir().join(format!("duckstream_case_{case}.binpb"));
+    std::fs::write(&path, fds.encode_to_vec())
+        .unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+    path
+}
+
+/// Compile a `.proto` file into a `FileDescriptorSet`, resolving imports
+/// relative to the file's own directory.
+fn compile_proto_file(proto: &std::path::Path) -> prost_types::FileDescriptorSet {
+    protox::compile(
+        [proto.file_name().unwrap()],
+        [proto.parent().unwrap().as_os_str()],
+    )
+    .unwrap_or_else(|e| panic!("compile {}: {e}", proto.display()))
+}
+
+/// Compile `tests/cases/<case>.proto` into a descriptor pool for building
+/// fixture messages.
+fn compile_case_pool(case: &str) -> prost_reflect::DescriptorPool {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let proto = root.join("tests/cases").join(format!("{case}.proto"));
+    prost_reflect::DescriptorPool::from_file_descriptor_set(compile_proto_file(&proto))
+        .expect("pool from compiled schema")
 }
 
 /// Run SQL through the DuckDB CLI with the extension loaded, in csv output mode

@@ -92,6 +92,36 @@ fn durable_resume() {
         .run_script();
 }
 
+/// Protobuf field extraction with the schema supplied as a pre-compiled
+/// `FileDescriptorSet` (`buf build -o` artifact form) instead of `.proto`
+/// source. The payloads derive from the committed `proto_descriptors.proto`.
+#[test]
+fn proto_descriptors() {
+    use harness::ProtoFieldValue as V;
+
+    Case::new("proto_descriptors")
+        .stream(&["orders.>"])
+        .publish_proto(
+            "orders.us.1",
+            "shop.Order",
+            &[
+                ("id", V::U64(1)),
+                ("total", V::F64(10.5)),
+                ("status", V::Text("new")),
+            ],
+        )
+        .publish_proto(
+            "orders.us.2",
+            "shop.Order",
+            &[
+                ("id", V::U64(2)),
+                ("total", V::F64(20.0)),
+                ("status", V::Text("shipped")),
+            ],
+        )
+        .run();
+}
+
 /// `jetstream_streams` reports every stream's configuration and state, one row
 /// per stream, and supports exact single-stream selection. Timestamps vary per
 /// run and the shared broker holds other cases' streams, so the enumeration

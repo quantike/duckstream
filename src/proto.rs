@@ -6,7 +6,9 @@
 //! `protoc` binary:
 //!
 //!   1. [`compile_proto`] turns a `.proto` file into a [`MessageDescriptor`]
-//!      via `protox` + `prost-reflect`.
+//!      via `protox` + `prost-reflect`, while [`load_descriptors`] builds one
+//!      from a pre-compiled `FileDescriptorSet` (`buf build -o`, or
+//!      `protoc --descriptor_set_out --include_imports`).
 //!   2. [`field_column`] reflects a (possibly nested) field path into its
 //!      DuckDB [`LogicalTypeId`].
 //!   3. [`decode_message`] + [`extract_value`] dynamically decode a payload and
@@ -16,6 +18,7 @@ use std::error::Error;
 use std::path::Path;
 
 use duckdb::core::LogicalTypeId;
+use prost::Message as _;
 use prost_reflect::{Cardinality, DescriptorPool, DynamicMessage, Kind, MessageDescriptor, Value};
 
 /// Errors from compiling a `.proto` schema or resolving a field path.
@@ -29,6 +32,12 @@ pub enum ProtoError {
     },
     #[error("message type '{message}' not found in '{file}'")]
     MessageNotFound { message: String, file: String },
+    #[error("failed to load descriptor set '{file}': {source}")]
+    LoadDescriptors {
+        file: String,
+        #[source]
+        source: Box<dyn Error + Send + Sync>,
+    },
     #[error("field path '{path}' not found in message '{message}'")]
     FieldNotFound { path: String, message: String },
     #[error("field path '{path}' descends into non-message field '{segment}'")]
@@ -66,6 +75,39 @@ pub fn compile_proto(file: &str, message: &str) -> Result<MessageDescriptor, Pro
         file: file.to_string(),
         source: Box::new(e),
     })?;
+
+    pool.get_message_by_name(message)
+        .ok_or_else(|| ProtoError::MessageNotFound {
+            message: message.to_string(),
+            file: file.to_string(),
+        })
+}
+
+/// Load a pre-compiled `FileDescriptorSet` and return the descriptor for the
+/// requested message type.
+///
+/// Accepts the output of `buf build -o` (a buf image is wire-compatible with
+/// `FileDescriptorSet`; its extra metadata decodes as unknown fields) and of
+/// `protoc --descriptor_set_out --include_imports`. Decoding is lenient, so a
+/// truncated or empty set decodes with no files and the lookup fails with
+/// [`ProtoError::MessageNotFound`].
+pub fn load_descriptors(file: &str, message: &str) -> Result<MessageDescriptor, ProtoError> {
+    let bytes = std::fs::read(file).map_err(|e| ProtoError::LoadDescriptors {
+        file: file.to_string(),
+        source: Box::new(e),
+    })?;
+    let fds = prost_types::FileDescriptorSet::decode(bytes.as_slice()).map_err(|e| {
+        ProtoError::LoadDescriptors {
+            file: file.to_string(),
+            source: Box::new(e),
+        }
+    })?;
+
+    let pool =
+        DescriptorPool::from_file_descriptor_set(fds).map_err(|e| ProtoError::LoadDescriptors {
+            file: file.to_string(),
+            source: Box::new(e),
+        })?;
 
     pool.get_message_by_name(message)
         .ok_or_else(|| ProtoError::MessageNotFound {
@@ -307,6 +349,73 @@ mod tests {
         compile_proto(path.to_str().unwrap(), "t.Msg").unwrap()
     }
 
+    /// Compile the schema and write its `FileDescriptorSet` to a fresh temp
+    /// file, returning the path. Mirrors `buf build -o` output.
+    fn write_test_descriptors() -> std::path::PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let unique = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "duckstream_proto_fds_{}_{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let proto_path = dir.join("t.proto");
+        std::fs::write(&proto_path, SCHEMA).unwrap();
+        let fds = protox::compile(["t.proto"], [dir.as_path()]).unwrap();
+        let fds_path = dir.join("descriptors.binpb");
+        std::fs::write(&fds_path, fds.encode_to_vec()).unwrap();
+        fds_path
+    }
+
+    #[test]
+    fn descriptors_load_and_map_types() {
+        let path = write_test_descriptors();
+        let desc = load_descriptors(path.to_str().unwrap(), "t.Msg").unwrap();
+        assert_eq!(
+            field_column(&desc, "id").unwrap().column_type,
+            LogicalTypeId::UBigint
+        );
+        assert_eq!(
+            field_column(&desc, "inner.name").unwrap().column_type,
+            LogicalTypeId::Varchar
+        );
+
+        let mut msg = DynamicMessage::new(desc.clone());
+        msg.set_field_by_name("label", Value::String("hi".into()));
+        let bytes = msg.encode_to_vec();
+        let decoded = decode_message(&desc, &bytes).unwrap();
+        assert!(matches!(
+            extract_value(&decoded, "label"),
+            ProtoValue::Text(ref s) if s == "hi"
+        ));
+    }
+
+    #[test]
+    fn descriptors_missing_message_is_named_error() {
+        let path = write_test_descriptors();
+        let err = load_descriptors(path.to_str().unwrap(), "t.Nope").unwrap_err();
+        assert!(matches!(err, ProtoError::MessageNotFound { .. }));
+    }
+
+    #[test]
+    fn descriptors_missing_file_is_read_error() {
+        let err = load_descriptors("/nonexistent/descriptors.binpb", "t.Msg").unwrap_err();
+        assert!(matches!(err, ProtoError::LoadDescriptors { .. }));
+    }
+
+    #[test]
+    fn descriptors_garbage_bytes_fail_to_pool() {
+        // Decodes as a FileDescriptorSet whose single FileDescriptorProto has
+        // name length 4 but no name bytes; the pool rejects it.
+        let dir =
+            std::env::temp_dir().join(format!("duckstream_proto_badfds_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bad.binpb");
+        std::fs::write(&path, [0x0A, 0x02, 0x0A, 0x04]).unwrap();
+        let err = load_descriptors(path.to_str().unwrap(), "t.Msg").unwrap_err();
+        assert!(matches!(err, ProtoError::LoadDescriptors { .. }));
+    }
+
     #[test]
     fn maps_scalar_types_to_duckdb() {
         let desc = compile_test_schema();
@@ -364,10 +473,7 @@ mod tests {
         inner.set_field_by_name("name", Value::String("deep".into()));
         msg.set_field_by_name("inner", Value::Message(inner));
 
-        let bytes = {
-            use prost::Message as _;
-            msg.encode_to_vec()
-        };
+        let bytes = msg.encode_to_vec();
         let decoded = decode_message(&desc, &bytes).unwrap();
 
         assert!(matches!(extract_value(&decoded, "id"), ProtoValue::U64(99)));
@@ -402,10 +508,7 @@ mod tests {
         inner.set_field_by_name("name", Value::String("deep".into()));
         msg.set_field_by_name("inner", Value::Message(inner));
 
-        let bytes = {
-            use prost::Message as _;
-            msg.encode_to_vec()
-        };
+        let bytes = msg.encode_to_vec();
 
         let message = decode_message(&desc, &bytes).unwrap();
         let json = message_to_json(&message).unwrap();
@@ -430,10 +533,7 @@ mod tests {
         let desc = compile_test_schema();
         let mut msg = DynamicMessage::new(desc.clone());
         msg.set_field_by_name("id", Value::U64(99));
-        let bytes = {
-            use prost::Message as _;
-            msg.encode_to_vec()
-        };
+        let bytes = msg.encode_to_vec();
         let decoded = decode_message(&desc, &bytes).unwrap();
         assert!(is_message_instance(&decoded, &bytes));
     }

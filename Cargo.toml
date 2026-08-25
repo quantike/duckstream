@@ -16,6 +16,7 @@ duckdb = { version = "~1.10505.0", features = ["loadable-extension", "vtab"] }
 futures-util = "0.3.32"
 prost = "0.14.4"
 prost-reflect = { version = "0.16.5", features = ["serde"] }
+prost-types = "0.14.4"
 protox = "0.9.1"
 serde_json = "1.0.150"
 thiserror = "2.0.18"

@@ -17,9 +17,10 @@ DuckDB v1.5.5.
 - Subject filtering with NATS token semantics (`*` matches one token, `>` matches trailing tokens).
 - JSON extraction: name JSON field paths (dot notation for nested fields) and get one column each. Scalars render as
   their natural value, nested values as JSON text.
-- Protocol Buffers extraction: supply a `.proto` schema at query time (compiled in pure Rust, no `protoc` binary
-  required) and get columns whose types are derived from the schema (`UBIGINT`, `DOUBLE`, `BOOLEAN`, and so on),
-  including nested-field descent.
+- Protocol Buffers extraction: supply a schema at query time, either a `.proto` source file (compiled in pure Rust,
+  no `protoc` binary required) or a pre-compiled descriptor set (`buf build -o`,
+  `protoc --descriptor_set_out --include_imports`), and get columns whose types are derived from the schema
+  (`UBIGINT`, `DOUBLE`, `BOOLEAN`, and so on), including nested-field descent.
 - Stream metadata: `jetstream_streams()` returns the configuration and live state of every stream (message counts,
   sequence bounds, retention, limits), one row per stream, or a single stream via `stream =>`.
 
@@ -58,15 +59,16 @@ subject filter server-side.
 | `batch`         | UBIGINT   | Messages requested per `fetch` while draining. Default `256`. Consumer modes.                                                                                                 |
 | `max_messages`  | UBIGINT   | Hard cap on the number of rows returned. Consumer modes.                                                                                                                      |
 | `json_extract`  | VARCHAR[] | JSON field paths, each mapped to a VARCHAR column.                                                                                                                            |
-| `proto_file`    | VARCHAR   | Path to a `.proto` schema file.                                                                                                                                               |
+| `proto_file`    | VARCHAR   | Path to a `.proto` schema file. Mutually exclusive with `proto_descriptors`.                                                                                                  |
+| `proto_descriptors` | VARCHAR | Path to a pre-compiled `FileDescriptorSet` (a `buf build -o` image works: it is wire-compatible). Mutually exclusive with `proto_file`.                                   |
 | `proto_message` | VARCHAR   | Message type name within the schema.                                                                                                                                          |
 | `proto_extract` | VARCHAR[] | Protobuf field paths, each mapped to a schema-typed column.                                                                                                                   |
 | `format`        | VARCHAR   | Type of the `payload` column: `blob` (default), `text`, or `json`. `json` emits VARCHAR aliased `JSON`, so the `json` extension operators (`->`, `->>`) apply without a cast. |
 | `ignore_errors` | BOOLEAN   | When `true`, payloads that fail to decode leave the affected columns NULL instead of failing the query. Default `false`.                                                      |
 | `headers`       | BOOLEAN   | `true` adds a `headers` column (VARCHAR aliased `JSON`) containing message headers serialized as a JSON object. Messages without headers yield NULL. NATS system headers (`Nats-*`) are filtered out. Default `false`. |
 
-`json_extract` and `proto_extract` cannot be used together. `proto_extract` requires both `proto_file` and
-`proto_message`. `durable` and `ephemeral` cannot be used together. `batch` and `max_messages` apply only to consumer
+`json_extract` and `proto_extract` cannot be used together. `proto_extract` requires `proto_message` and one schema
+source (`proto_file` or `proto_descriptors`). `durable` and `ephemeral` cannot be used together. `batch` and `max_messages` apply only to consumer
 modes. Durable consumers ack each message on emit, advancing the cursor (at-least-once: a cancelled query redelivers
 unacked messages on the next run).
 
@@ -74,7 +76,7 @@ unacked messages on the next run).
 (which add their own columns), so it composes with either. `format => 'json'` on a JSON stream is lazy: bytes are
 emitted unparsed and DuckDB validates on access, except that `ignore_errors` drops clearly-non-JSON payloads to NULL.
 `format => 'text'` requires valid UTF-8; a non-UTF-8 payload fails the query unless `ignore_errors => true`, which drops
-it to NULL. Supplying `proto_file`/`proto_message` with `format => 'json'` decodes each message and serializes it to the
+it to NULL. Supplying a proto schema and `proto_message` with `format => 'json'` decodes each message and serializes it to the
 `payload` column (field names verbatim from the `.proto`), so `proto_extract` is not required in that case.
 
 By default, a payload that does not match the chosen decoder fails the query, naming the stream and sequence and
@@ -108,6 +110,14 @@ FROM read_jetstream('ORDERS',
     proto_file    => 'order.proto',
     proto_message => 'shop.Order',
     proto_extract => ['id', 'total']);
+
+-- Same, but against a descriptor set from a schema pipeline
+-- (buf build -o descriptors.binpb, or protoc --descriptor_set_out --include_imports)
+SELECT sum(total)
+FROM read_jetstream('ORDERS',
+    proto_descriptors => 'descriptors.binpb',
+    proto_message     => 'shop.Order',
+    proto_extract     => ['id', 'total']);
 
 -- Emit the payload as JSON and navigate it in SQL with -> / ->>
 SELECT payload->>'$.customer.name' AS customer, payload->>'$.total' AS total
@@ -237,7 +247,9 @@ Requirements:
   ```
 
 Snapshots live in `tests/snapshots/` and are reviewed with `cargo insta review`. The `.sql` files stay runnable by hand;
-they use `${NATS_URL}`, `${STREAM}`, and `${SUBJECT_PREFIX}` placeholders the harness substitutes. CI runs this suite in
+they use `${NATS_URL}`, `${STREAM}`, and `${SUBJECT_PREFIX}` placeholders the harness substitutes. Descriptor cases also
+use `${DESCRIPTORS}`, which the harness compiles from the case's `.proto`; to run those by hand, point it at a pre-built
+`FileDescriptorSet` (for example `buf build -o out.binpb`). CI runs this suite in
 `integration.yml`.
 
 Note: against the Docker broker the scan-mode cases take ~30s each because the extension's scan path holds its NATS
