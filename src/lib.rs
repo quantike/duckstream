@@ -20,6 +20,7 @@
 //! - [`config`]: pure parameter parsing/validation ([`StartSpec`](config::StartSpec),
 //!   subject matching, timestamp parsing).
 //! - [`streams`]: the `jetstream_streams` table function (stream catalog).
+//! - [`subjects`]: the `jetstream_subjects` table function (per-subject counts).
 //! - [`stream`]: async JetStream stream/consumer I/O (consumer creation, time→sequence resolution).
 //! - [`row`]: the `Bytes`-backed [`Row`](row::Row) buffered between message
 //!   acquisition and column writing.
@@ -45,6 +46,7 @@ mod proto;
 mod row;
 mod stream;
 mod streams;
+mod subjects;
 
 use config::{subject_matches, PayloadFormat, StartSpec};
 use proto::ProtoField;
@@ -717,6 +719,7 @@ impl VTab for ReadJetstream {
 pub unsafe fn extension_entrypoint(con: Connection) -> Result<(), Box<dyn Error>> {
     con.register_table_function::<ReadJetstream>("read_jetstream")?;
     streams::register(&con)?;
+    subjects::register(&con)?;
     Ok(())
 }
 

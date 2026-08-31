@@ -1,0 +1,12 @@
+---
+source: tests/harness.rs
+assertion_line: 257
+expression: output
+---
+subject,messages
+it_subjects.orders.eu.3,1
+it_subjects.orders.us.1,1
+it_subjects.orders.us.2,1
+subject,messages
+it_subjects.orders.us.1,1
+it_subjects.orders.us.2,1
