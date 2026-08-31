@@ -122,6 +122,33 @@ fn proto_descriptors() {
         .run();
 }
 
+/// `jetstream_subjects` reports per-subject message counts for one stream,
+/// one row per distinct subject, and applies the server-side `subject` filter.
+#[test]
+fn subjects() {
+    Case::new("subjects")
+        .stream(&["orders.>"])
+        .publish("orders.us.1", br#"{"id":1}"#)
+        .publish("orders.us.2", br#"{"id":2}"#)
+        .publish("orders.eu.3", br#"{"id":3}"#)
+        .run();
+}
+
+/// `jetstream_subjects` must emit past one `func` chunk: more distinct
+/// subjects than the extension's `VECTOR_SIZE` (2048), with `count(*)`
+/// proving the chunk boundary loses or duplicates no rows. Server-side
+/// paging stays untested here: the server's page limit is 100,000 subjects
+/// (`JSMaxSubjectDetails`), too slow to seed, and the drain loop is a plain
+/// `while let` over the library's stream.
+#[test]
+fn subjects_multi_chunk() {
+    let mut case = Case::new("subjects_multi_chunk").stream(&["orders.>"]);
+    for i in 0..2049 {
+        case = case.publish(&format!("orders.{i}"), br#"{"id":1}"#);
+    }
+    case.run();
+}
+
 /// `jetstream_streams` reports every stream's configuration and state, one row
 /// per stream, and supports exact single-stream selection. Timestamps vary per
 /// run and the shared broker holds other cases' streams, so the enumeration

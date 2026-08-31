@@ -23,13 +23,15 @@ DuckDB v1.5.5.
   (`UBIGINT`, `DOUBLE`, `BOOLEAN`, and so on), including nested-field descent.
 - Stream metadata: `jetstream_streams()` returns the configuration and live state of every stream (message counts,
   sequence bounds, retention, limits), one row per stream, or a single stream via `stream =>`.
+- Per-subject message counts: `jetstream_subjects(stream)` returns one row per distinct subject in a stream, with an
+  optional server-side `subject =>` filter. Useful for finding hot subjects before a filtered read.
 
 ## SQL API
 
-The extension registers two table functions: `read_jetstream` (message reads) and `jetstream_streams` (stream
-catalog). It returns five base columns (`stream`, `subject`, `seq`,
-`ts_nats`, `payload`) plus one extra column per extracted JSON or protobuf field, and an optional `headers` column
-(when `headers => true`).
+The extension registers three table functions: `read_jetstream` (message reads), `jetstream_streams` (stream
+catalog), and `jetstream_subjects` (per-subject counts). `read_jetstream` returns five base columns (`stream`,
+`subject`, `seq`, `ts_nats`, `payload`) plus one extra column per extracted JSON or protobuf field, and an optional
+`headers` column (when `headers => true`).
 
 ### `read_jetstream(stream, ...)`
 
@@ -170,6 +172,31 @@ SELECT stream, messages, last_seq FROM jetstream_streams() ORDER BY stream;
 
 -- One stream: check state and find the last sequence
 SELECT messages, last_seq, retention FROM jetstream_streams(stream => 'ORDERS');
+```
+
+### `jetstream_subjects(stream)`
+
+Per-subject message counts for one stream, one row per distinct subject (exact subject literals, never wildcard
+patterns). A point-in-time snapshot taken at query start. Useful for finding hot subjects before a filtered
+`read_jetstream` read, or verifying that a stream's subject coverage matches expectations.
+
+| Column     | Type    | Description                                 |
+| ---------- | ------- | ------------------------------------------- |
+| `stream`   | VARCHAR | Stream name.                                |
+| `subject`  | VARCHAR | Distinct subject literal.                   |
+| `messages` | UBIGINT | Messages currently stored on that subject.  |
+
+Parameters: `stream` (VARCHAR, positional, required), `subject` (VARCHAR, optional, server-side filter with token
+wildcards `*` and `>`), and `url` (VARCHAR, default `nats://localhost:4222`).
+
+```sql
+-- Hot subjects first
+SELECT subject, messages
+FROM jetstream_subjects('ORDERS')
+ORDER BY messages DESC;
+
+-- Only the US subtree
+SELECT * FROM jetstream_subjects('ORDERS', subject => 'orders.us.>');
 ```
 
 ## Building
