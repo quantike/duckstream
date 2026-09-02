@@ -49,6 +49,10 @@ pub struct RowWriter<'a> {
     pub json_fields: &'a [String],
     pub proto_descriptor: Option<&'a MessageDescriptor>,
     pub proto_fields: &'a [ProtoField],
+    /// Configured NATS subject filter. Not applied here (rows arriving are
+    /// already filtered); consumed by [`non_proto_hint`] to flag wildcard
+    /// filters that may span several proto message types.
+    pub subject_filter: Option<&'a str>,
     pub base: BaseVectorsMut<'a>,
     pub json_vecs: Vec<FlatVector<'a>>,
     pub proto_vecs: Vec<FlatVector<'a>>,
@@ -93,7 +97,7 @@ impl<'a> RowWriter<'a> {
                 return Err(ScanError::NonProtoPayload {
                     stream: self.stream_name.to_string(),
                     seq: row.seq,
-                    hint: non_proto_hint(&row.payload),
+                    hint: non_proto_hint(&row.payload, self.subject_filter),
                 });
             }
             Some(decoded)
@@ -265,19 +269,37 @@ pub fn non_json_hint(payload: &[u8]) -> String {
     }
 }
 
-/// Hint appended to a protobuf decode error, suggesting the JSON decoder when
-/// the payload looks like JSON. Returns a leading `": ..."` fragment or empty.
+/// Hint appended to a protobuf decode error: suggests the JSON decoder when
+/// the payload looks like JSON, and warns that a wildcard subject filter can
+/// span several proto message types. Returns a leading `": ..."` fragment or
+/// empty.
 ///
-/// A lead-byte sniff suffices for a hint, unlike the decode guard
+/// The wildcard warning matters because protobuf has no way to declare "one
+/// message type per subject token": streams that multiplex message types need
+/// one `proto_message` (and one query) per type, unioned in SQL. A lead-byte
+/// sniff suffices for a hint, unlike the decode guard
 /// [`crate::proto::is_message_instance`].
-pub fn non_proto_hint(payload: &[u8]) -> String {
-    let opens_json = matches!(lead_byte(payload), Some(b'{') | Some(b'['));
-    if opens_json {
-        ": the payload looks like JSON; use json_extract instead of proto_file or \
-         proto_descriptors, proto_message, and proto_extract"
-            .to_string()
-    } else {
+pub fn non_proto_hint(payload: &[u8], subject_filter: Option<&str>) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+
+    if matches!(lead_byte(payload), Some(b'{') | Some(b'[')) {
+        parts.push(
+            "the payload looks like JSON; use json_extract instead of proto_file or \
+             proto_descriptors, proto_message, and proto_extract",
+        );
+    }
+    if subject_filter.is_some_and(|f| f.contains('*') || f.contains('>')) {
+        parts.push(
+            "a wildcard subject filter can match payloads of several proto message types; \
+             query each type with its own subject filter and proto_message, and union \
+             the results",
+        );
+    }
+
+    if parts.is_empty() {
         String::new()
+    } else {
+        format!(": {}", parts.join("; "))
     }
 }
 
@@ -343,12 +365,31 @@ mod tests {
 
     #[test]
     fn proto_hint_flags_json_text() {
-        assert!(non_proto_hint(b"{\"a\":1}").contains("json_extract"));
-        assert!(non_proto_hint(b"   [1,2]").contains("json_extract"));
+        assert!(non_proto_hint(b"{\"a\":1}", None).contains("json_extract"));
+        assert!(non_proto_hint(b"   [1,2]", None).contains("json_extract"));
     }
 
     #[test]
-    fn proto_hint_is_empty_for_binary() {
-        assert_eq!(non_proto_hint(b"\x0A\x26abc"), "");
+    fn proto_hint_is_empty_for_binary_without_wildcards() {
+        assert_eq!(non_proto_hint(b"\x0A\x26abc", None), "");
+        assert_eq!(non_proto_hint(b"\x0A\x26abc", Some("orders.new")), "");
+    }
+
+    #[test]
+    fn proto_hint_flags_wildcard_subject_filter() {
+        for filter in ["orders.*", "orders.>", "orders.*.created"] {
+            assert!(
+                non_proto_hint(b"\x0A\x26abc", Some(filter)).contains("wildcard"),
+                "{filter}"
+            );
+        }
+    }
+
+    #[test]
+    fn proto_hint_combines_json_and_wildcard() {
+        let hint = non_proto_hint(b"{\"a\":1}", Some("orders.*"));
+        assert!(hint.contains("json_extract"));
+        assert!(hint.contains("wildcard"));
+        assert!(hint.starts_with(": "));
     }
 }

@@ -416,9 +416,10 @@ impl Drop for ReadJetstreamInitData {
 /// consumer path; [`Source`] holds the source-specific cursor.
 struct ScanState {
     stream_name: String,
-    /// Optional subject filter. Applied client-side in scan mode; applied
-    /// server-side (the consumer's `filter_subject`) in consumer mode, where it
-    /// stays `None` here.
+    /// Optional subject filter. Applied client-side in scan mode and
+    /// server-side (the consumer's `filter_subject`) in consumer mode. Kept
+    /// populated in both modes so the protobuf decode-error hint can flag
+    /// wildcard filters spanning several message types.
     subject: Option<String>,
     /// JSON field paths to extract as extra columns.
     json_fields: Vec<String>,
@@ -555,7 +556,9 @@ impl VTab for ReadJetstream {
         let bind_data = unsafe { &*info.get_bind_data::<ReadJetstreamBindData>() };
 
         // Consumer mode (ephemeral or durable): reuse the runtime + consumer
-        // created during bind. Subject filtering is server-side for consumers.
+        // created during bind. Subject filtering is server-side for consumers
+        // (the consumer's `filter_subject`); `state.subject` stays populated
+        // only to drive the decode-error hint.
         if bind_data.ephemeral || bind_data.durable.is_some() {
             let setup = bind_data
                 .consumer_setup
@@ -564,7 +567,7 @@ impl VTab for ReadJetstream {
                 .take()
                 .expect("consumer setup missing from bind data");
 
-            let mut state = ScanState::from_bind(
+            let state = ScanState::from_bind(
                 bind_data,
                 Source::Consumer {
                     consumer: Box::new(setup.consumer),
@@ -573,7 +576,6 @@ impl VTab for ReadJetstream {
                 },
                 setup.pending == 0,
             );
-            state.subject = None;
 
             return Ok(ReadJetstreamInitData {
                 runtime: Some(setup.runtime),
@@ -635,6 +637,7 @@ impl VTab for ReadJetstream {
         // config could be hoisted into the init data as shared, read-only data
         // (e.g. Arc) and borrowed instead of cloned.
         let stream_name = state.stream_name.clone();
+        let subject_filter = state.subject.clone();
         let json_fields = state.json_fields.clone();
         let format = state.format;
         let ignore_errors = state.ignore_errors;
@@ -654,6 +657,7 @@ impl VTab for ReadJetstream {
             json_fields: &json_fields,
             proto_descriptor: proto_descriptor.as_ref(),
             proto_fields: &proto_fields,
+            subject_filter: subject_filter.as_deref(),
             base: output::BaseVectorsMut {
                 stream: output.flat_vector(0),
                 subject: output.flat_vector(1),
