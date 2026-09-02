@@ -46,6 +46,10 @@ A bounded read that always completes. It runs in one of three modes:
 Both consumer modes report their message count as the query cardinality, so DuckDB shows a progress bar, and apply the
 subject filter server-side.
 
+Direct Get has no server-side filter: a scan fetches every message in the requested range and applies `subject`
+client-side, discarding the rest. A filtered scan of a large stream reads the whole range before returning anything,
+with no progress bar. Use `ephemeral` or `durable` for filtered reads; scan only for whole ranges.
+
 | Parameter       | Type      | Description                                                                                                                                                                   |
 | --------------- | --------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `stream`        | VARCHAR   | Stream name (positional, required).                                                                                                                                           |
