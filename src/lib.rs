@@ -199,9 +199,8 @@ fn create_consumer_setup(
 /// A [`Row`] holds reference-counted `Bytes` for the subject and payload, so
 /// buffering clones no message bytes. The buffer decouples acquisition from
 /// column writing, which the tail path (an async channel drain) will need.
-fn acquire_rows(state: &mut ScanState, runtime: &Runtime) -> Vec<Row> {
-    let subject_filter = state.subject.clone();
-    let headers_enabled = state.headers;
+fn acquire_rows(config: &ReadConfig, state: &mut ScanState, runtime: &Runtime) -> Vec<Row> {
+    let headers_enabled = config.headers;
     let mut rows: Vec<Row> = Vec::with_capacity(VECTOR_SIZE);
 
     match &mut state.source {
@@ -235,7 +234,7 @@ fn acquire_rows(state: &mut ScanState, runtime: &Runtime) -> Vec<Row> {
                 };
 
                 // Scan filtering is client-side (no server consumer).
-                if let Some(filter) = &subject_filter {
+                if let Some(filter) = config.subject.as_deref() {
                     if !subject_matches(filter, msg.subject.as_str()) {
                         continue;
                     }
@@ -382,6 +381,7 @@ struct ReadJetstreamInitData {
     /// `Option` so [`Drop`] can `take` it for [`Runtime::shutdown_timeout`];
     /// always `Some` outside teardown.
     runtime: Option<Runtime>,
+    config: ReadConfig,
     inner: Mutex<ScanState>,
 }
 
@@ -410,11 +410,12 @@ impl Drop for ReadJetstreamInitData {
     }
 }
 
-/// Mutable read progress, guarded by the init data's mutex.
+/// Read-only configuration for one `read_jetstream` call, shared across
+/// `func` invocations via the init data.
 ///
-/// Despite the name, this backs both the Direct Get scan path and the ephemeral
-/// consumer path; [`Source`] holds the source-specific cursor.
-struct ScanState {
+/// Never mutated after init, so `func` borrows it from the shared init data
+/// instead of cloning through the mutex.
+struct ReadConfig {
     stream_name: String,
     /// Optional subject filter. Applied client-side in scan mode and
     /// server-side (the consumer's `filter_subject`) in consumer mode. Kept
@@ -432,15 +433,10 @@ struct ScanState {
     proto_fields: Vec<ProtoField>,
     /// When true, emit a `headers` column with serialized message headers.
     headers: bool,
-    source: Source,
-    done: bool,
 }
 
-impl ScanState {
-    /// Construct a `ScanState` from the bind data plus a resolved source and
-    /// the initial `done` flag. The shared config fields are copied from the
-    /// bind data so the lock on `init.inner` is the only state `func` needs.
-    fn from_bind(bind_data: &ReadJetstreamBindData, source: Source, done: bool) -> Self {
+impl ReadConfig {
+    fn from_bind(bind_data: &ReadJetstreamBindData) -> Self {
         Self {
             stream_name: bind_data.stream.clone(),
             subject: bind_data.subject.clone(),
@@ -450,10 +446,17 @@ impl ScanState {
             proto_descriptor: bind_data.proto_descriptor.clone(),
             proto_fields: bind_data.proto_fields.clone(),
             headers: bind_data.headers,
-            source,
-            done,
         }
     }
+}
+
+/// Mutable read progress, guarded by the init data's mutex.
+///
+/// Despite the name, this backs both the Direct Get scan path and the ephemeral
+/// consumer path; [`Source`] holds the source-specific cursor.
+struct ScanState {
+    source: Source,
+    done: bool,
 }
 
 /// The source of messages for a read.
@@ -557,8 +560,8 @@ impl VTab for ReadJetstream {
 
         // Consumer mode (ephemeral or durable): reuse the runtime + consumer
         // created during bind. Subject filtering is server-side for consumers
-        // (the consumer's `filter_subject`); `state.subject` stays populated
-        // only to drive the decode-error hint.
+        // (the consumer's `filter_subject`); `ReadConfig::subject` stays
+        // populated only to drive the decode-error hint.
         if bind_data.ephemeral || bind_data.durable.is_some() {
             let setup = bind_data
                 .consumer_setup
@@ -567,18 +570,18 @@ impl VTab for ReadJetstream {
                 .take()
                 .expect("consumer setup missing from bind data");
 
-            let state = ScanState::from_bind(
-                bind_data,
-                Source::Consumer {
+            let state = ScanState {
+                source: Source::Consumer {
                     consumer: Box::new(setup.consumer),
                     remaining: setup.pending,
                     batch: setup.batch,
                 },
-                setup.pending == 0,
-            );
+                done: setup.pending == 0,
+            };
 
             return Ok(ReadJetstreamInitData {
                 runtime: Some(setup.runtime),
+                config: ReadConfig::from_bind(bind_data),
                 inner: Mutex::new(state),
             });
         }
@@ -599,19 +602,19 @@ impl VTab for ReadJetstream {
         ))?;
 
         let done = scan.end_seq == 0 || scan.current_seq > scan.end_seq;
-        let state = ScanState::from_bind(
-            bind_data,
-            Source::Scan {
+        let state = ScanState {
+            source: Source::Scan {
                 client: scan.client,
                 stream: Box::new(scan.stream),
                 current_seq: scan.current_seq,
                 end_seq: scan.end_seq,
             },
             done,
-        );
+        };
 
         Ok(ReadJetstreamInitData {
             runtime: Some(runtime),
+            config: ReadConfig::from_bind(bind_data),
             inner: Mutex::new(state),
         })
     }
@@ -629,35 +632,24 @@ impl VTab for ReadJetstream {
         }
 
         let runtime = init.runtime.as_ref().expect("runtime present outside drop");
-        let rows = acquire_rows(&mut state, runtime);
-
-        // PERF: these clones happen on every func call (once per output vector).
-        // They exist to release the `state` mutex borrow before writing to the
-        // output vectors. The field lists are small, but for hot paths this
-        // config could be hoisted into the init data as shared, read-only data
-        // (e.g. Arc) and borrowed instead of cloned.
-        let stream_name = state.stream_name.clone();
-        let subject_filter = state.subject.clone();
-        let json_fields = state.json_fields.clone();
-        let format = state.format;
-        let ignore_errors = state.ignore_errors;
-        let proto_descriptor = state.proto_descriptor.clone();
-        let proto_fields = state.proto_fields.clone();
-        let headers = state.headers;
+        let rows = acquire_rows(&init.config, &mut state, runtime);
         drop(state);
+
+        let json_fields = &init.config.json_fields;
+        let proto_fields = &init.config.proto_fields;
 
         // JSON and proto extraction are mutually exclusive, so the headers
         // column (when enabled) follows whichever list is present.
         let extra_count = json_fields.len().max(proto_fields.len());
 
         let mut writer = output::RowWriter {
-            stream_name: &stream_name,
-            format,
-            ignore_errors,
-            json_fields: &json_fields,
-            proto_descriptor: proto_descriptor.as_ref(),
-            proto_fields: &proto_fields,
-            subject_filter: subject_filter.as_deref(),
+            stream_name: &init.config.stream_name,
+            format: init.config.format,
+            ignore_errors: init.config.ignore_errors,
+            json_fields,
+            proto_descriptor: init.config.proto_descriptor.as_ref(),
+            proto_fields,
+            subject_filter: init.config.subject.as_deref(),
             base: output::BaseVectorsMut {
                 stream: output.flat_vector(0),
                 subject: output.flat_vector(1),
@@ -673,7 +665,10 @@ impl VTab for ReadJetstream {
             proto_vecs: (0..proto_fields.len())
                 .map(|i| output.flat_vector(5 + i))
                 .collect(),
-            headers_vec: headers.then(|| output.flat_vector(5 + extra_count)),
+            headers_vec: init
+                .config
+                .headers
+                .then(|| output.flat_vector(5 + extra_count)),
         };
 
         for (n, row) in rows.iter().enumerate() {
