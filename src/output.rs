@@ -88,6 +88,7 @@ impl<'a> RowWriter<'a> {
                 return Err(ScanError::NonProtoPayload {
                     stream: self.stream_name.to_string(),
                     seq: row.seq,
+                    message: descriptor.name().to_string(),
                     hint: non_proto_hint(&row.payload, self.subject_filter),
                 });
             }
@@ -242,8 +243,8 @@ pub fn json_extract_string(doc: &serde_json::Value, path: &str) -> Option<String
 /// exact bytes worth flagging.
 pub fn non_json_hint(payload: &[u8]) -> String {
     if payload.first().is_some_and(|&b| b < 0x20) {
-        ": the payload looks binary (e.g. protobuf); use proto_file or \
-         proto_descriptors, proto_message, and proto_extract instead of json_extract"
+        ": the payload looks binary (e.g. protobuf); use the proto_* parameters \
+         instead of json_extract"
             .to_string()
     } else {
         String::new()
@@ -259,15 +260,13 @@ pub fn non_proto_hint(payload: &[u8], subject_filter: Option<&str>) -> String {
 
     if matches!(lead_byte(payload), Some(b'{') | Some(b'[')) {
         parts.push(
-            "the payload looks like JSON; use json_extract instead of proto_file or \
-             proto_descriptors, proto_message, and proto_extract",
+            "the payload looks like JSON; use json_extract instead of the proto_* parameters",
         );
     }
     if subject_filter.is_some_and(|f| f.contains('*') || f.contains('>')) {
         parts.push(
-            "a wildcard subject filter can match payloads of several proto message types; \
-             query each type with its own subject filter and proto_message, and union \
-             the results",
+            "the wildcard subject filter may span several message types; use one \
+             message type per query and union the results",
         );
     }
 
