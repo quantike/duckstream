@@ -59,13 +59,16 @@ pub enum ScanError {
         hint: String,
     },
     #[error(
-        "proto payload on stream '{stream}' at seq {seq} failed to decode as the configured \
-         message{hint}. Set ignore_errors => true to skip undecodable payloads."
+        "proto payload on stream '{stream}' at seq {seq} failed to decode as {message}{hint}. \
+         Set ignore_errors => true to skip undecodable payloads."
     )]
     NonProtoPayload {
         stream: String,
         seq: u64,
-        /// Leading `": ..."` hint suggesting the JSON decoder, or empty.
+        /// The configured `proto_message` that the payload failed to match.
+        message: String,
+        /// Leading `": ..."` hint suggesting the JSON decoder or a wildcard
+        /// subject filter, or empty.
         hint: String,
     },
     #[error("{present} requires {missing} (both are needed to decode a protobuf payload)")]
