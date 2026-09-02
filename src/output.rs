@@ -14,11 +14,8 @@ use crate::error::ScanError;
 use crate::proto::{self, ProtoField, ProtoValue};
 use crate::row::Row;
 
-/// Write an extracted protobuf value into a typed DuckDB flat vector at `row`.
-///
-/// The column type was chosen at bind time to match the field's protobuf kind,
-/// so each [`ProtoValue`] variant lines up with the vector's storage. A
-/// [`ProtoValue::Null`] (missing field or undecodable payload) sets SQL NULL.
+/// Write an extracted protobuf value into the typed flat vector chosen at
+/// bind time to match the field's kind.
 pub fn write_proto_value(vec: &mut FlatVector, row: usize, value: ProtoValue) {
     // Safety: `row` < VECTOR_SIZE and vectors are sized for STANDARD_VECTOR_SIZE;
     // rows are written sequentially from 0.
@@ -36,12 +33,12 @@ pub fn write_proto_value(vec: &mut FlatVector, row: usize, value: ProtoValue) {
     }
 }
 
-/// Bundles the per-`func`-call config and output vectors so the row-writing
-/// loop in `func` is a thin `write_row` call per row.
+/// Bundles the per-`func`-call config and output vectors so `func` stays a
+/// thin loop.
 ///
-/// Extra-column vectors follow the five base columns at index 5+. JSON and
-/// proto extraction are mutually exclusive, so both vector lists start at 5.
-/// The `headers` column (when present) follows the extraction columns.
+/// Extra-column vectors follow the five base columns at index 5+; JSON and
+/// proto extraction are mutually exclusive, so both lists start there, with
+/// `headers` last.
 pub struct RowWriter<'a> {
     pub stream_name: &'a str,
     pub format: PayloadFormat,
@@ -49,9 +46,8 @@ pub struct RowWriter<'a> {
     pub json_fields: &'a [String],
     pub proto_descriptor: Option<&'a MessageDescriptor>,
     pub proto_fields: &'a [ProtoField],
-    /// Configured NATS subject filter. Not applied here (rows arriving are
-    /// already filtered); consumed by [`non_proto_hint`] to flag wildcard
-    /// filters that may span several proto message types.
+    /// Configured subject filter, consumed by [`non_proto_hint`] only; rows
+    /// reaching the writer are already filtered.
     pub subject_filter: Option<&'a str>,
     pub base: BaseVectorsMut<'a>,
     pub json_vecs: Vec<FlatVector<'a>>,
@@ -59,9 +55,8 @@ pub struct RowWriter<'a> {
     pub headers_vec: Option<FlatVector<'a>>,
 }
 
-/// Mutable handles to the base-column vectors (indices 0-4), written for
-/// every row. Split out so [`RowWriter`] borrows them distinctly from the
-/// extra-column vectors.
+/// Mutable handles to the base-column vectors (indices 0-4), split out so
+/// [`RowWriter`] borrows them distinctly from the extra-column vectors.
 pub struct BaseVectorsMut<'a> {
     pub stream: FlatVector<'a>,
     pub subject: FlatVector<'a>,
@@ -71,9 +66,7 @@ pub struct BaseVectorsMut<'a> {
 }
 
 impl<'a> RowWriter<'a> {
-    /// Write one row into every output vector at index `n`. Returns
-    /// [`ScanError`] when a payload fails the configured decode and
-    /// `ignore_errors` is false.
+    /// Write one row into every output vector at index `n`.
     pub fn write_row(&mut self, n: usize, row: &Row) -> Result<(), ScanError> {
         self.base.stream.insert(n, self.stream_name);
         self.base.subject.insert(n, row.subject.as_str());
@@ -87,8 +80,6 @@ impl<'a> RowWriter<'a> {
         // Decoded once to drive the error check, the extracted columns, and the
         // format => 'json' payload path.
         let proto_decoded = if let Some(descriptor) = self.proto_descriptor {
-            // Same predicate drives both reactions: throw by default, skip
-            // under ignore_errors.
             let decoded = proto::decode_message(descriptor, &row.payload);
             let is_instance = decoded
                 .as_ref()
@@ -129,8 +120,6 @@ impl<'a> RowWriter<'a> {
         match (self.format, has_proto) {
             (PayloadFormat::Blob, _) => self.base.payload.insert(n, row.payload.as_ref()),
             (PayloadFormat::Text, _) => {
-                // Fail loudly on non-UTF-8 unless the caller opted into
-                // dropping undecodable payloads.
                 write_utf8_payload(&mut self.base.payload, n, &row.payload, self.ignore_errors)
                     .map_err(|_| ScanError::NonUtf8Payload {
                         stream: self.stream_name.to_string(),
@@ -148,8 +137,8 @@ impl<'a> RowWriter<'a> {
                 }
             }
             (PayloadFormat::Json, false) => {
-                // Emitted unparsed; DuckDB validates JSON at query time. Only
-                // non-UTF-8 is rejected here, mirroring format => 'text'.
+                // Emitted unparsed; DuckDB validates JSON at query time, so
+                // only non-UTF-8 is rejected here.
                 write_utf8_payload(&mut self.base.payload, n, &row.payload, self.ignore_errors)
                     .map_err(|_| ScanError::NonUtf8Payload {
                         stream: self.stream_name.to_string(),
@@ -198,19 +187,16 @@ impl<'a> RowWriter<'a> {
     }
 }
 
-/// The payload was not valid UTF-8 and `ignore_errors` was not set, so
-/// [`write_utf8_payload`] left the slot untouched. The caller attaches
-/// stream/seq context and raises its own typed error.
+/// Marker for non-UTF-8 without `ignore_errors`; the caller raises the typed
+/// error with stream/seq context.
 #[derive(Debug)]
 pub struct NonUtf8Payload;
 
-/// Write a raw payload into a VARCHAR flat vector as UTF-8 text, shared by the
-/// `format => 'text'` and non-proto `format => 'json'` paths.
+/// Write a raw payload into a VARCHAR vector as UTF-8 text, shared by
+/// `format => 'text'` and non-proto `format => 'json'`.
 ///
-/// Writes the text, or SQL NULL when `ignore_errors` drops an undecodable
-/// payload. Returns [`NonUtf8Payload`] on non-UTF-8 without `ignore_errors`,
-/// leaving the slot untouched so the caller can raise a typed error with
-/// stream/seq context via `?`.
+/// SQL NULL when `ignore_errors` drops an undecodable payload;
+/// [`NonUtf8Payload`] otherwise, leaving the slot untouched.
 pub fn write_utf8_payload(
     vec: &mut FlatVector,
     row: usize,
@@ -230,14 +216,11 @@ pub fn write_utf8_payload(
     }
 }
 
-/// Extract a value from a JSON document by dot-separated path and render it as
-/// a string suitable for a VARCHAR column.
+/// Extract a value by dot-separated path and render it as a VARCHAR string.
 ///
-/// Path segments navigate nested objects (`order.id` descends `order` then
-/// `id`). Scalars render naturally (`42`, `2.5`, `true`, unquoted strings);
-/// nested objects and arrays render as compact JSON text so they can be
-/// re-parsed or `CAST` downstream. Returns `None` when the path is absent or
-/// resolves to JSON `null`, which the caller maps to SQL NULL.
+/// Scalars render naturally (`42`, `2.5`, `true`, unquoted strings); objects
+/// and arrays render as compact JSON text. Returns `None` for absent paths and
+/// JSON `null`, which the caller maps to SQL NULL.
 pub fn json_extract_string(doc: &serde_json::Value, path: &str) -> Option<String> {
     let mut current = doc;
     for segment in path.split('.') {
@@ -247,8 +230,6 @@ pub fn json_extract_string(doc: &serde_json::Value, path: &str) -> Option<String
     match current {
         serde_json::Value::Null => None,
         serde_json::Value::String(s) => Some(s.clone()),
-        // Numbers and booleans render via their natural JSON form (no trailing
-        // zeros for integers), everything else (objects/arrays) as JSON text.
         other => Some(other.to_string()),
     }
 }
@@ -273,12 +254,6 @@ pub fn non_json_hint(payload: &[u8]) -> String {
 /// the payload looks like JSON, and warns that a wildcard subject filter can
 /// span several proto message types. Returns a leading `": ..."` fragment or
 /// empty.
-///
-/// The wildcard warning matters because protobuf has no way to declare "one
-/// message type per subject token": streams that multiplex message types need
-/// one `proto_message` (and one query) per type, unioned in SQL. A lead-byte
-/// sniff suffices for a hint, unlike the decode guard
-/// [`crate::proto::is_message_instance`].
 pub fn non_proto_hint(payload: &[u8], subject_filter: Option<&str>) -> String {
     let mut parts: Vec<&str> = Vec::new();
 
@@ -316,7 +291,6 @@ mod tests {
     fn json_scalar_extraction() {
         let doc = serde_json::json!({"status": "new", "count": 42, "ratio": 2.5, "ok": true});
         assert_eq!(json_extract_string(&doc, "status").as_deref(), Some("new"));
-        // Integers render without trailing zeros (unlike the old C++ behavior).
         assert_eq!(json_extract_string(&doc, "count").as_deref(), Some("42"));
         assert_eq!(json_extract_string(&doc, "ratio").as_deref(), Some("2.5"));
         assert_eq!(json_extract_string(&doc, "ok").as_deref(), Some("true"));
@@ -335,7 +309,6 @@ mod tests {
     #[test]
     fn json_nested_object_as_text() {
         let doc = serde_json::json!({"order": {"id": 7}});
-        // A path resolving to an object renders as compact JSON text.
         assert_eq!(
             json_extract_string(&doc, "order").as_deref(),
             Some(r#"{"id":7}"#)
@@ -352,7 +325,8 @@ mod tests {
 
     #[test]
     fn hint_flags_protobuf_like_binary() {
-        // 0x0A: protobuf field 1, length-delimited. Also ASCII newline.
+        // 0x0A: protobuf field-1 tag, and ASCII newline, which the raw
+        // first-byte check must not skip.
         let proto = b"\x0A\x26c1fb1bb4-e595-4db7-a434";
         assert!(non_json_hint(proto).contains("protobuf"));
     }
